@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#0a0c10">
+<meta name="description" content="JUAN WEB LAB — Web Infrastructure Diagnostics. Inspect your server. Test your network. Understand your environment.">
+<title>JUAN WEB LAB — Web Infrastructure Diagnostics</title>
+<link rel="stylesheet" href="css/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%230a0c10'/><text x='6' y='22' font-family='monospace' font-size='16' fill='%2322d3ee'>J</text></svg>">
+</head>
+<body>
+
+<div class="grid-bg" aria-hidden="true"></div>
+
+<header class="site-header">
+  <div class="header-inner">
+    <div class="brand">
+      <span class="brand-mark">▚</span>
+      <div>
+        <div class="brand-name">JUAN WEB LAB</div>
+        <div class="brand-tag">WEB INFRASTRUCTURE DIAGNOSTICS</div>
+      </div>
+    </div>
+    <button id="navToggle" class="nav-toggle" aria-label="Menu" aria-expanded="false" aria-controls="mainNav">
+      <span></span><span></span><span></span>
+    </button>
+    <nav id="mainNav" class="main-nav" aria-label="Sections">
+      <a href="#dashboard">Dashboard</a>
+      <a href="#client">Client</a>
+      <a href="#network">Network</a>
+      <a href="#server">Server</a>
+      <a href="#http">HTTP</a>
+      <a href="#ssl">SSL</a>
+      <a href="#performance">Performance</a>
+      <a href="#capabilities">Capabilities</a>
+      <a href="#terminal">Terminal</a>
+    </nav>
+    <div class="header-status">
+      <span class="status-dot dot-green pulse"></span>
+      <span id="systemStatus">SYSTEM ONLINE</span>
+    </div>
+  </div>
+</header>
+
+<main id="top">
+
+  <!-- ============ DASHBOARD ============ -->
+  <section id="dashboard" class="hero panel-plain">
+    <p class="hero-kicker">// REAL-WORLD VPS · HOSTING · NETWORK · BROWSER TEST PAGE</p>
+    <h1 class="hero-title">JUAN WEB LAB</h1>
+    <h2 class="hero-sub">SYSTEM DIAGNOSTICS</h2>
+    <p class="hero-line">Inspect your server. Test your network. Understand your environment.</p>
+
+    <div class="hero-actions">
+      <button id="btnFullDiag" class="btn btn-primary">RUN FULL DIAGNOSTIC</button>
+      <button id="btnQuickTest" class="btn btn-outline">QUICK TEST</button>
+      <button id="btnExport" class="btn btn-ghost">EXPORT REPORT</button>
+    </div>
+
+    <div class="diag-progress hidden" id="diagProgress">
+      <pre class="progress-bar" id="progressBar">[░░░░░░░░░░░░░░░░░░░░]   0%</pre>
+      <div class="progress-label" id="progressLabel">Idle.</div>
+    </div>
+
+    <div class="health-grid panel">
+      <div class="panel-head"><h3>SYSTEM HEALTH</h3><span class="badge" id="healthScoreBadge">— / 100</span></div>
+      <div class="health-rows" id="healthRows">
+        <div class="row"><span class="k">SERVER</span><span class="v status st-gray">● UNKNOWN</span></div>
+        <div class="row"><span class="k">NETWORK</span><span class="v status st-gray">● UNKNOWN</span></div>
+        <div class="row"><span class="k">HTTPS</span><span class="v status st-gray">● UNKNOWN</span></div>
+        <div class="row"><span class="k">BROWSER</span><span class="v status st-gray">● UNKNOWN</span></div>
+        <div class="row"><span class="k">PERFORMANCE</span><span class="v status st-gray">● UNKNOWN</span></div>
+        <div class="row"><span class="k">DATABASE</span><span class="v status st-gray">● UNKNOWN</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ CLIENT DEVICE ============ -->
+  <section id="client" class="panel">
+    <div class="panel-head"><h2>CLIENT DEVICE</h2><span class="badge badge-cyan">LOCAL</span></div>
+    <p class="panel-desc">Detected from your browser via standard Web APIs. Nothing is fingerprinted or stored.</p>
+    <div class="data cols-2" id="clientData"><div class="skeleton"></div></div>
+  </section>
+
+  <!-- ============ NETWORK ============ -->
+  <section id="network" class="panel">
+    <div class="panel-head"><h2>NETWORK</h2><span class="badge badge-cyan">LIVE</span></div>
+    <div class="data cols-2" id="networkData"><div class="skeleton"></div></div>
+
+    <div class="subpanel">
+      <div class="panel-head"><h3>LATENCY TEST</h3>
+        <button class="btn btn-small btn-outline" data-action="latency">RUN LATENCY TEST</button>
+      </div>
+      <div class="data cols-2" id="latencyData"><div class="muted">Not tested yet.</div></div>
+      <div class="verdict" id="latencyVerdict"></div>
+    </div>
+  </section>
+
+  <!-- ============ SERVER INFO ============ -->
+  <section id="server" class="panel">
+    <div class="panel-head"><h2>SERVER INFORMATION</h2><span class="badge" id="serverBadge">API</span></div>
+    <p class="panel-desc">Served by the diagnostics API running on this host. Requires the bundled Node.js backend; otherwise values show NOT AVAILABLE.</p>
+    <div class="data cols-2" id="serverData"><div class="skeleton"></div></div>
+
+    <div class="subpanel">
+      <div class="panel-head"><h3>SERVER OS</h3></div>
+      <div class="data cols-2" id="osData"><div class="skeleton"></div></div>
+    </div>
+
+    <div class="subpanel">
+      <div class="panel-head"><h3>LIVE SERVER</h3><span class="live-indicator" id="liveIndicator">● IDLE</span></div>
+      <div class="data" id="liveData"><div class="muted">Waiting for backend…</div></div>
+      <canvas id="liveChart" height="90" aria-label="CPU history chart"></canvas>
+    </div>
+  </section>
+
+  <!-- ============ WEB SERVER ============ -->
+  <section id="webserver" class="panel">
+    <div class="panel-head"><h2>WEB SERVER</h2><span class="badge" id="webServerBadge">API + HEADERS</span></div>
+    <div class="data cols-2" id="webServerData"><div class="skeleton"></div></div>
+  </section>
+
+  <!-- ============ HTTP DIAGNOSTICS ============ -->
+  <section id="http" class="panel">
+    <div class="panel-head"><h2>HTTP DIAGNOSTICS</h2><span class="badge badge-cyan">REAL REQUEST</span></div>
+    <pre class="terminal-box" id="httpTerminal">$ GET / HTTP/1.1
+Host: <span id="httpHost">…</span>
+User-Agent: JUAN-WEB-LAB/1.0
+
+→ sending request…</pre>
+    <div class="data cols-2" id="httpData"><div class="skeleton"></div></div>
+    <div class="subpanel">
+      <div class="panel-head"><h3>RESPONSE HEADERS</h3></div>
+      <pre class="terminal-box small scroll-y" id="httpHeaders">…</pre>
+    </div>
+  </section>
+
+  <!-- ============ TLS / SSL ============ -->
+  <section id="ssl" class="panel">
+    <div class="panel-head"><h2>TLS / SSL</h2><span class="badge" id="sslVerdict">CHECKING…</span></div>
+    <div class="data cols-2" id="sslData"><div class="skeleton"></div></div>
+  </section>
+
+  <!-- ============ DNS ============ -->
+  <section id="dns" class="panel">
+    <div class="panel-head"><h2>DNS DIAGNOSTICS</h2>
+      <button class="btn btn-small btn-outline" data-action="dns">RUN DNS TEST</button>
+    </div>
+    <p class="panel-desc">Resolved server-side via the diagnostics API (Node dns module). Browser-only setups cannot resolve DNS records.</p>
+    <div class="data cols-2" id="dnsData"><div class="muted">Not tested yet.</div></div>
+  </section>
+
+  <!-- ============ EDGE / CDN ============ -->
+  <section id="edge" class="panel">
+    <div class="panel-head"><h2>EDGE / CDN</h2><span class="badge badge-cyan">HEADERS</span></div>
+    <div class="data cols-2" id="edgeData"><div class="skeleton"></div></div>
+  </section>
+
+  <!-- ============ SERVER CLOCK ============ -->
+  <section id="clock" class="panel">
+    <div class="panel-head"><h2>SERVER CLOCK</h2><span class="badge badge-cyan">OFFSET</span></div>
+    <div class="clock-grid">
+      <div class="clock-cell"><div class="clock-label">CLIENT TIME</div><div class="clock-time" id="clientClock">--:--:--</div></div>
+      <div class="clock-cell"><div class="clock-label">SERVER TIME</div><div class="clock-time" id="serverClock">--:--:--</div></div>
+      <div class="clock-cell"><div class="clock-label">OFFSET</div><div class="clock-time" id="clockOffset">—</div></div>
+    </div>
+  </section>
+
+  <!-- ============ PERFORMANCE ============ -->
+  <section id="performance" class="panel">
+    <div class="panel-head"><h2>WEB PERFORMANCE</h2><span class="badge badge-cyan">PERFORMANCE API</span></div>
+    <div class="perf-bar-wrap"><div class="perf-bar" id="perfBar"></div></div>
+    <div class="data cols-2" id="perfData"><div class="skeleton"></div></div>
+    <div class="verdict" id="perfVerdict"></div>
+  </section>
+
+  <!-- ============ BROWSER CAPABILITIES ============ -->
+  <section id="capabilities" class="panel">
+    <div class="panel-head"><h2>BROWSER CAPABILITIES</h2><span class="badge" id="capsBadge">TESTING…</span></div>
+    <div class="cap-grid" id="capGrid"><div class="skeleton"></div></div>
+  </section>
+
+  <!-- ============ STORAGE ============ -->
+  <section id="storage" class="panel">
+    <div class="panel-head"><h2>STORAGE</h2><span class="badge badge-cyan">WRITE TEST</span></div>
+    <div class="data cols-2" id="storageData"><div class="skeleton"></div></div>
+  </section>
+
+  <!-- ============ JS ENGINE ============ -->
+  <section id="jsengine" class="panel">
+    <div class="panel-head"><h2>JAVASCRIPT ENGINE</h2>
+      <button class="btn btn-small btn-outline" data-action="benchmark">RUN BENCHMARK</button>
+    </div>
+    <div class="data cols-2" id="jsData"><div class="skeleton"></div></div>
+    <div class="subpanel">
+      <div class="panel-head"><h3>BENCHMARK RESULT</h3></div>
+      <div class="data cols-2" id="benchData"><div class="muted">Not run yet.</div></div>
+    </div>
+  </section>
+
+  <!-- ============ DATABASE ============ -->
+  <section id="database" class="panel">
+    <div class="panel-head"><h2>DATABASE</h2><span class="badge" id="dbBadge">API</span></div>
+    <div class="data cols-2" id="dbData"><div class="skeleton"></div></div>
+  </section>
+
+  <!-- ============ API TESTER ============ -->
+  <section id="apitester" class="panel">
+    <div class="panel-head"><h2>API TESTER</h2><span class="badge badge-cyan">CLIENT-SIDE FETCH</span></div>
+    <p class="panel-desc">Requests are sent directly from your browser (no server proxy → no SSRF surface). Cross-origin requests depend on target CORS policy.</p>
+    <form id="apiForm" class="api-form">
+      <div class="api-row">
+        <select id="apiMethod" class="field field-method" aria-label="Method">
+          <option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option>
+        </select>
+        <input id="apiUrl" class="field field-url" type="url" placeholder="https://example.com/api" required aria-label="URL">
+        <button type="submit" class="btn btn-primary btn-send">SEND REQUEST</button>
+      </div>
+      <details class="api-details">
+        <summary>Headers &amp; Body</summary>
+        <textarea id="apiHeaders" class="field" rows="3" placeholder='{"Content-Type":"application/json"}' aria-label="Headers JSON"></textarea>
+        <textarea id="apiBody" class="field" rows="4" placeholder='{"key":"value"}' aria-label="Body"></textarea>
+      </details>
+    </form>
+    <div id="apiResult" class="hidden">
+      <div class="data cols-2" id="apiMeta"></div>
+      <div class="panel-head"><h3>RESPONSE HEADERS</h3></div>
+      <pre class="terminal-box small scroll-y" id="apiRespHeaders"></pre>
+      <div class="panel-head"><h3>RESPONSE BODY</h3></div>
+      <pre class="terminal-box small scroll-y" id="apiRespBody"></pre>
+    </div>
+  </section>
+
+  <!-- ============ HTTP STATUS LAB ============ -->
+  <section id="statuslab" class="panel">
+    <div class="panel-head"><h2>HTTP STATUS LAB</h2><span class="badge badge-cyan">REFERENCE</span></div>
+    <div class="code-grid" id="codeGrid"></div>
+    <div class="code-detail hidden" id="codeDetail">
+      <div class="code-detail-head"><span id="cdCode"></span><span id="cdMeaning"></span></div>
+      <div class="data" id="cdBody"></div>
+    </div>
+  </section>
+
+  <!-- ============ TERMINAL ============ -->
+  <section id="terminal" class="panel">
+    <div class="panel-head"><h2>TERMINAL</h2><span class="badge badge-cyan">INTERACTIVE</span></div>
+    <div class="term-window">
+      <div class="term-bar"><span class="term-dot r"></span><span class="term-dot y"></span><span class="term-dot g"></span><span class="term-title">juan@web-lab: ~</span></div>
+      <div class="term-out scroll-y" id="termOut" aria-live="polite"></div>
+      <form class="term-input-row" id="termForm">
+        <label for="termInput" class="term-prompt">juan@web-lab:~$</label>
+        <input id="termInput" class="term-input" autocomplete="off" spellcheck="false" placeholder="type 'help'" aria-label="Terminal command">
+      </form>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <div>JUAN WEB LAB — WEB INFRASTRUCTURE DIAGNOSTICS</div>
+  <div class="muted">No fake data. No tracking. Values marked NOT AVAILABLE were not detectable on this device/server.</div>
+</footer>
+
+<div id="toastWrap" class="toast-wrap" aria-live="polite"></div>
+
+<script src="js/app.js"></script>
+</body>
+</html>
