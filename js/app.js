@@ -450,9 +450,11 @@ async function runClientTests() {
     ["Timezone", c.timezone],
     ["Online", RS(state.isOnline ? "ONLINE" : "OFFLINE", state.isOnline ? "passed" : "failed")],
     ["Color Scheme", c.darkMode ? "Dark preferred" : "Light preferred"],
-    ["Reduced Motion", c.reducedMotion ? "Enabled" : "No preference"],
-    ["User Agent", c.ua]
+    ["Reduced Motion", c.reducedMotion ? "Enabled" : "No preference"]
   ]);
+  /* long UA value gets its own collapsible so it can never break layout */
+  $("#body-client").insertAdjacentHTML("beforeend",
+    `<details class="ua-details"><summary>User Agent (full value)</summary><div class="ua-value">${esc(c.ua)}</div></details>`);
   updateViewportPanel();
   return info;
 }
@@ -1443,7 +1445,7 @@ async function runDiagnostic(order) {
   Engine.running = true;
   Engine.cancelled = false;
   Engine.runId = newRunId();
-  Engine.runStartedAt = Date.now();
+  Engine.runStartedAt = performance.now();
   Engine.results.clear();
   state.currentRun = { id: Engine.runId, order };
 
@@ -1740,6 +1742,8 @@ function tprint(html, cls = "") {
   termOut.scrollTop = termOut.scrollHeight;
   return div;
 }
+/* plain-text prompt used in output lines (wraps safely via pre-wrap) */
+const PROMPT = "juan@web-lab:~$";
 async function ttype(text, cls = "") {
   const div = tprint("", cls);
   const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -1838,7 +1842,7 @@ const COMMANDS = {
 
 async function execCommand(raw) {
   const cmd = raw.trim();
-  tprint(`<span class="t-dim">juan@web-lab:~$</span> <span class="t-cmd">${esc(cmd)}</span>`);
+  tprint(`<span class="t-dim">${esc(PROMPT)}</span> <span class="t-cmd">${esc(cmd)}</span>`);
   if (!cmd) return;
   termHistory.unshift(cmd);
   histIdx = -1;
@@ -1884,7 +1888,7 @@ termInput.addEventListener("keydown", e => {
   }
   if (e.key === "c" && e.ctrlKey) {
     e.preventDefault();
-    tprint(`<span class="t-dim">juan@web-lab:~$</span> <span class="t-cmd">${esc(termInput.value)}</span>^C`);
+    tprint(`<span class="t-dim">${esc(PROMPT)}</span> <span class="t-cmd">${esc(termInput.value)}</span>^C`);
     termInput.value = "";
   }
 });
@@ -1928,6 +1932,30 @@ $$("#mainNav a").forEach(a => a.addEventListener("click", () => {
 
   updateViewportPanel();
   tickClock();
+
+  /* optional dev tool: ?debug=overflow reports any element wider than the viewport */
+  if (/debug=overflow/.test(location.search)) {
+    setTimeout(() => {
+      const vw = document.documentElement.clientWidth;
+      const bad = [...document.querySelectorAll("body *")]
+        .filter(el => {
+          const cs = getComputedStyle(el);
+          if (cs.display === "none" || cs.visibility === "hidden") return false;
+          /* skip intentionally clipped/hidden helpers like .visually-hidden */
+          const r = el.getBoundingClientRect();
+          return r.width > 2 && r.right > vw + 1;
+        })
+        .slice(0, 25)
+        .map(el => `${el.tagName.toLowerCase()}${el.id ? "#" + el.id : ""}${typeof el.className === "string" && el.className ? "." + el.className.split(" ").filter(Boolean).join(".") : ""}`);
+      const sw = document.documentElement.scrollWidth;
+      console.warn(`[overflow audit] viewport ${vw}px · doc scrollWidth ${sw} · flagged ${bad.length}`);
+      bad.forEach(line => console.warn("  " + line));
+      toast(`Overflow audit: scrollW ${sw}/${vw}, ${bad.length} flagged`, bad.length ? "warn" : "ok");
+      /* expose results for automated/headless verification */
+      document.title = `AUDIT|${innerWidth}|${sw}|${bad.length}|${bad.slice(0, 4).join(",")}`;
+      window.__overflowAudit = { viewport: innerWidth, scrollWidth: sw, flagged: bad };
+    }, 2500);
+  }
 
   /* backend probe */
   try {

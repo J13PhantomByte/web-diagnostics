@@ -120,7 +120,7 @@
       <div class="live-bars-wrap" id="liveData">
         <div class="chart-state chart-empty">SERVER METRICS UNAVAILABLE<br><span>Connect the JUAN WEB LAB backend to display live CPU and memory metrics.</span></div>
       </div>
-      <div class="chart-box" id="cpuChartBox" style="height:180px">
+      <div class="chart-box" id="cpuChartBox">
         <canvas id="cpuChart" aria-label="CPU usage history chart" role="img"></canvas>
         <div class="chart-overlay chart-empty hidden"><div>NO DATA AVAILABLE</div><span>Polling backend metrics…</span></div>
       </div>
@@ -143,7 +143,7 @@
       </div>
       <div class="data cols-2" id="latencyData"><div class="muted">Not tested yet. Run the latency test to collect real response times.</div></div>
       <div class="verdict" id="latencyVerdict"></div>
-      <div class="chart-box" id="latencyChartBox" style="height:200px">
+      <div class="chart-box" id="latencyChartBox">
         <canvas id="latencyChart" aria-label="Latency per request in milliseconds" role="img"></canvas>
         <div class="chart-overlay chart-empty hidden"><div>NO DATA AVAILABLE</div><span>Run the test to collect metrics.</span></div>
       </div>
@@ -179,7 +179,7 @@
 
     <div class="subpanel">
       <div class="panel-head"><h3>METRICS TIMELINE</h3></div>
-      <div class="chart-box" id="perfChartBox" style="height:220px">
+      <div class="chart-box" id="perfChartBox">
         <canvas id="perfChart" aria-label="Performance metrics bar chart" role="img"></canvas>
         <div class="chart-overlay chart-empty hidden"><div>NO DATA AVAILABLE</div><span>Metrics appear after page load events fire.</span></div>
       </div>
@@ -395,7 +395,7 @@
       <div class="term-bar"><span class="term-dot r"></span><span class="term-dot y"></span><span class="term-dot g"></span><span class="term-title">juan@web-lab: ~</span></div>
       <div class="term-out scroll-y" id="termOut" aria-live="polite" aria-label="Terminal output"></div>
       <form class="term-input-row" id="termForm" autocomplete="off">
-        <label for="termInput" class="term-prompt">juan@web-lab:~$</label>
+        <label for="termInput" class="term-prompt"><span class="tp-host">juan@web-lab</span>:~$</label>
         <input id="termInput" class="term-input" type="text" inputmode="text" autocapitalize="off"
                autocomplete="off" spellcheck="false" enterkeyhint="send"
                placeholder="type 'help'" aria-label="Terminal command input">
