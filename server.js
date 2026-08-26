@@ -9,6 +9,9 @@ const net = require("net");
 
 const PORT = process.env.PORT || 3000;
 const ROOT = __dirname;
+const VERSION = "2.0.0";
+const STARTED = Date.now();
+
 const MIME = {
   ".html": "text/html; charset=utf-8",
   ".css": "text/css; charset=utf-8",
@@ -20,9 +23,28 @@ const MIME = {
   ".txt": "text/plain; charset=utf-8"
 };
 
+/* ============================================================
+   Response contract:
+   success → { "success": true,  "data": { ... } }
+   failure → { "success": false, "error": { code, message } }
+   ============================================================ */
+
+function sendJSON(res, code, payload) {
+  const body = JSON.stringify(payload);
+  res.writeHead(code, {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-store",
+    "Content-Length": Buffer.byteLength(body),
+    "Access-Control-Allow-Origin": "*"
+  });
+  res.end(body);
+}
+const ok = (res, data) => sendJSON(res, 200, { success: true, data });
+const fail = (res, code, errCode, message) => sendJSON(res, code, { success: false, error: { code: errCode, message } });
+
 /* ---------------- rate limiting ---------------- */
 const buckets = new Map();
-function rateLimit(req, res, max = 30, windowMs = 10000) {
+function rateLimit(req, res, max = 60, windowMs = 10000) {
   const key = req.socket.remoteAddress || "unknown";
   const now = Date.now();
   let b = buckets.get(key);
@@ -30,27 +52,17 @@ function rateLimit(req, res, max = 30, windowMs = 10000) {
   if (buckets.size > 5000) buckets.clear();
   b.count++;
   if (b.count > max) {
-    sendJSON(res, 429, { error: "rate limit exceeded" });
+    fail(res, 429, "RATE_LIMITED", "Too many requests. Slow down and retry shortly.");
     return false;
   }
   return true;
 }
 
-/* ---------------- helpers ---------------- */
-function sendJSON(res, code, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(code, {
-    "Content-Type": "application/json",
-    "Cache-Control": "no-store",
-    "Content-Length": Buffer.byteLength(body)
-  });
-  res.end(body);
-}
-
+/* ---------------- system collectors ---------------- */
 let cachedCpuSample = null;
 function cpuUsagePct() {
   return new Promise(resolve => {
-    if (cachedCpuSample && Date.now() - cachedCpuSample.t < 2000) return resolve(cachedCpuSample.v);
+    if (cachedCpuSample && Date.now() - cachedCpuSample.t < 1500) return resolve(cachedCpuSample.v);
     const cpus1 = os.cpus();
     setTimeout(() => {
       const cpus2 = os.cpus();
@@ -64,39 +76,37 @@ function cpuUsagePct() {
       const v = total ? Math.round((1 - idle / total) * 100) : null;
       cachedCpuSample = { t: Date.now(), v };
       resolve(v);
-    }, 250);
+    }, 200);
   });
 }
 
 function diskUsage() {
   return new Promise(resolve => {
+    const fromStat = (st) => {
+      if (!st || !st.blocks || !st.bsize) return false;
+      const total = st.blocks * st.bsize;
+      const free = st.bavail * st.bsize;
+      resolve({ total, free, used: total - free });
+      return true;
+    };
     if (typeof fs.statfs === "function") {
-      const target = process.platform === "win32" ? process.env.SystemDrive || "C:\\" : "/";
+      const target = process.platform === "win32" ? (process.env.SystemDrive || "C:\\") : "/";
       fs.statfs(target, (err, st) => {
-        if (!err && st && st.blocks) {
-          const total = st.blocks * st.bsize;
-          const free = st.bavail * st.bsize;
-          return resolve({ total, free, used: total - free });
-        }
+        if (fromStat(st)) return;
         resolve({});
       });
     } else if (process.platform !== "win32") {
-      fs.statfs("/", (err, st) => {
-        if (err || !st) return resolve({});
-        const total = st.blocks * st.bsize;
-        const free = st.bavail * st.bsize;
-        resolve({ total, free, used: total - free });
-      });
+      fs.statfs("/", (err, st) => { fromStat(st) || resolve({}); });
     } else {
       require("child_process").exec(
-        "powershell -NoProfile -Command \"Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object { \\\"{0} {1} {2}\\\" -f $_.FreeSpace,$_.Size,$_.DeviceID }\"",
+        "powershell -NoProfile -Command \"Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object { \\\"{0} {1}\\\" -f $_.FreeSpace,$_.Size }\"",
         (err, out) => {
           if (err || !out) return resolve({});
           let total = 0, free = 0;
           out.trim().split(/\r?\n/).filter(Boolean).forEach(line => {
-            const parts = line.trim().split(/\s+/);
-            free += Number(parts[0]) || 0;
-            total += Number(parts[1]) || 0;
+            const p = line.trim().split(/\s+/);
+            free += Number(p[0]) || 0;
+            total += Number(p[1]) || 0;
           });
           resolve(total ? { total, free, used: total - free } : {});
         }
@@ -111,12 +121,12 @@ function detectVirtualization() {
     fs.readFile("/proc/cpuinfo", "utf8", (err, data) => {
       if (!err && /hypervisor/i.test(data)) return resolve("KVM / Hyper-V (hypervisor flag)");
       fs.readFile("/proc/1/cgroup", "utf8", (err2, cg) => {
-        if (!err2 && /docker|lxc|containerd|kubepods/i.test(cg)) {
+        if (!err2) {
           const m = cg.match(/docker|lxc|containerd|kubepods/i);
-          return resolve("Container: " + m[0]);
+          if (m) return resolve("Container: " + m[0]);
         }
         require("child_process").exec("systemd-detect-virt 2>/dev/null", (e3, out3) => {
-          resolve(e3 || !out3.trim() ? null : out3.trim());
+          resolve(e3 || !String(out3).trim() ? null : String(out3).trim());
         });
       });
     });
@@ -124,33 +134,15 @@ function detectVirtualization() {
 }
 
 function detectDistro(cb) {
-  if (process.platform === "win32") return cb({ osDist: "Windows", osVersion: os.release() });
-  if (process.platform === "darwin") return cb({ osDist: "macOS", osVersion: os.release() });
+  if (process.platform === "win32") return cb({ dist: "Windows", version: os.release() });
+  if (process.platform === "darwin") return cb({ dist: "macOS", version: os.release() });
   fs.readFile("/etc/os-release", "utf8", (err, data) => {
     if (err) return cb({});
-    const get = k => (data.match(new RegExp("^" + k + "=.?([^\n]+?)\.?$", "m")) || [])[1];
-    cb({ osDist: get("NAME"), osVersion: get("PRETTY_NAME")?.split(" ").slice(1).join(" ") || get("VERSION_ID") });
+    const get = k => (data.match(new RegExp("^" + k + "=?\"?([^\n\"]+)\"?", "m")) || [])[1];
+    cb({ dist: get("NAME"), version: get("PRETTY_NAME")?.split(" ").slice(1).join(" ") || get("VERSION_ID") });
   });
 }
 
-function dnsProviderOf(ns) {
-  const map = [
-    [/cloudflare|ns1\.cloudflare/i, "Cloudflare DNS"],
-    [/googledomains|dns\.google/i, "Google Cloud DNS"],
-    [/awsdns/i, "AWS Route 53"],
-    [/azure|microsoft/i, "Azure DNS"],
-    [/digitalocean/i, "DigitalOcean DNS"],
-    [/namecheap|registrar-servers/i, "Namecheap"],
-    [/godaddy|domaincontrol/i, "GoDaddy"],
-    [/vultr/i, "Vultr"],
-    [/hetzner/i, "Hetzner"]
-  ];
-  const joined = ns.join(" ");
-  for (const [re, name] of map) if (re.test(joined)) return name;
-  return null;
-}
-
-/* ---------------- API handlers ---------------- */
 function serverLanIp() {
   for (const list of Object.values(os.networkInterfaces())) {
     for (const ni of list || []) {
@@ -159,158 +151,206 @@ function serverLanIp() {
   }
   return null;
 }
+function clientIpOf(req) {
+  const h = req.headers;
+  const cand = h["cf-connecting-ip"] || h["x-real-ip"] || (h["x-forwarded-for"] || "").split(",")[0].trim();
+  return cand || (req.socket.remoteAddress || "").replace("::ffff:", "") || null;
+}
 
-async function handleServerInfo(req, res) {
+function dnsProviderOf(ns) {
+  const map = [
+    [/cloudflare/i, "Cloudflare DNS"],
+    [/dns\.google|googledomains/i, "Google Cloud DNS"],
+    [/awsdns/i, "AWS Route 53"],
+    [/azure|microsoft/i, "Azure DNS"],
+    [/digitalocean/i, "DigitalOcean DNS"],
+    [/namecheap|registrar-servers/i, "Namecheap"],
+    [/domaincontrol|godaddy/i, "GoDaddy"],
+    [/vultr/i, "Vultr"],
+    [/hetzner/i, "Hetzner"]
+  ];
+  const joined = ns.join(" ");
+  for (const [re, name] of map) if (re.test(joined)) return name;
+  return null;
+}
+
+/* ---------------- handlers ---------------- */
+async function hStatus(req, res) {
+  ok(res, { service: "juan-web-lab-backend", version: VERSION, uptimeSec: Math.round((Date.now() - STARTED) / 1000), time: new Date().toISOString(), platform: process.platform });
+}
+
+async function hPing(req, res) {
+  ok(res, { t: Date.now() });
+}
+
+async function hServer(req, res) {
   const disk = await diskUsage();
   const virt = await detectVirtualization();
+  const memTotal = os.totalmem(), memFree = os.freemem();
   detectDistro(distro => {
-    const memTotal = os.totalmem();
-    const memFree = os.freemem();
-    sendJSON(res, 200, {
-      ip: serverLanIp(),
+    ok(res, {
       hostname: os.hostname(),
-      os: distro.osDist || `${os.type()} ${os.release()}`,
-      osVersion: distro.osVersion || os.release(),
+      os: distro.dist || `${os.type()} ${os.release()}`,
+      osVersion: distro.version || os.release(),
       kernel: os.release(),
-      arch: os.arch(),
+      architecture: os.arch(),
       platform: process.platform,
       cpuModel: os.cpus()[0]?.model?.trim() || null,
       cpuCores: os.cpus().length,
-      cpuUsage: null,
-      memTotal,
-      memFree,
-      memUsed: memTotal - memFree,
-      memPct: Math.round(((memTotal - memFree) / memTotal) * 100),
+      memoryTotal: memTotal,
+      memoryUsed: memTotal - memFree,
+      memoryFree: memFree,
+      memoryPct: Math.round(((memTotal - memFree) / memTotal) * 100),
       diskTotal: disk.total ?? null,
       diskUsed: disk.used ?? null,
       diskFree: disk.free ?? null,
       diskPct: disk.total ? Math.round((disk.used / disk.total) * 100) : null,
-      loadavg: os.loadavg().map(n => Number(n.toFixed(2))),
       uptime: Math.round(os.uptime()),
+      loadAverage: os.loadavg().map(n => Number(n.toFixed(2))),
       bootTime: new Date(Date.now() - os.uptime() * 1000).toISOString(),
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      datetime: new Date().toString(),
+      serverTime: new Date().toString(),
       virtualization: virt,
-      container: virt && /^Container/i.test(virt) ? virt.replace(/^Container:\s*/i, "") : null
+      container: virt && /^Container/i.test(virt) ? virt.replace(/^Container:\s*/i, "") : null,
+      serverIp: serverLanIp()
     });
   });
 }
 
-async function handleLive(req, res) {
+async function hMetrics(req, res) {
   const cpuPct = await cpuUsagePct();
   const disk = await diskUsage();
   const memTotal = os.totalmem();
-  sendJSON(res, 200, {
+  ok(res, {
     cpuPct,
     memPct: Math.round(((memTotal - os.freemem()) / memTotal) * 100),
     diskPct: disk.total ? Math.round((disk.used / disk.total) * 100) : null,
-    load1: os.loadavg()[0].toFixed(2),
+    load1: Number(os.loadavg()[0].toFixed(2)),
     uptime: Math.round(os.uptime()),
     timestamp: Date.now()
   });
 }
 
-async function handleDNS(req, res) {
-  let host = (req.headers.host || "").split(":")[0];
-  if (!host || host === "localhost" || /^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes("::")) {
-    return sendJSON(res, 200, { domain: host || null, error: "no public domain to resolve (accessed by IP or localhost)" });
-  }
-  const t0 = Date.now();
-  const out = { domain: host };
-  try {
-    out.a = await dns.resolve4(host).catch(() => []);
-    out.aaaa = await dns.resolve6(host).catch(() => []);
-    out.ns = await dns.resolveNs(host).catch(() => []);
-    try { out.cname = (await dns.resolveCname(host))[0] || null; } catch { out.cname = null; }
-    out.provider = out.ns.length ? dnsProviderOf(out.ns) : null;
-    out.resolveMs = Date.now() - t0;
-  } catch (e) {
-    return sendJSON(res, 200, { domain: host, error: e.code || "resolution failed" });
-  }
-  sendJSON(res, 200, out);
+async function hNetwork(req, res) {
+  ok(res, { ip: clientIpOf(req), source: req.headers["cf-connecting-ip"] ? "cdn-header" : "socket" });
 }
 
-async function handleDatabase(req, res) {
+async function hDns(req, res) {
+  const host = (req.headers.host || "").split(":")[0];
+  if (!host || host === "localhost" || /^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes("::")) {
+    return fail(res, 200, "NO_PUBLIC_DOMAIN", "No public domain to resolve (host accessed by IP or localhost).");
+  }
   const t0 = Date.now();
+  try {
+    const [a, aaaa, ns] = await Promise.all([
+      dns.resolve4(host).catch(() => []),
+      dns.resolve6(host).catch(() => []),
+      dns.resolveNs(host).catch(() => [])
+    ]);
+    let cname = null;
+    try { cname = (await dns.resolveCname(host))[0] || null; } catch {}
+    ok(res, {
+      domain: host,
+      a, aaaa, ns, cname,
+      provider: ns.length ? dnsProviderOf(ns) : null,
+      resolveMs: Date.now() - t0
+    });
+  } catch (e) {
+    fail(res, 200, "DNS_LOOKUP_FAILED", e.code || "DNS resolution failed.");
+  }
+}
+
+async function hDatabase(req, res) {
   const probe = (port, name) => new Promise(resolve => {
     const sock = net.connect({ host: "127.0.0.1", port, timeout: 1200 });
     sock.on("connect", () => { sock.destroy(); resolve(name); });
     sock.on("error", () => resolve(null));
     sock.on("timeout", () => { sock.destroy(); resolve(null); });
   });
+  const t0 = Date.now();
   const found = (await probe(3306, "MySQL / MariaDB")) ||
     (await probe(5432, "PostgreSQL")) ||
     (await probe(27017, "MongoDB")) ||
     (await probe(6379, "Redis"));
-  sendJSON(res, 200, {
+  ok(res, {
     connected: !!found,
     database: found,
     version: null,
-    responseMs: Date.now() - t0,
-    detail: found ? "TCP port open on localhost. Version requires credentials (not exposed)." : "No common database port detected on localhost."
+    latencyMs: Date.now() - t0,
+    detail: found
+      ? "TCP port open on localhost. Version requires credentials (not exposed)."
+      : "No common database port detected on localhost."
   });
 }
 
-/* ---------------- static ---------------- */
+/* ---------------- static files ---------------- */
 function serveStatic(req, res, urlPath) {
   let p = decodeURIComponent(urlPath.split("?")[0]);
-  if (p === "/" ) p = "/index.html";
+  if (p === "/") p = "/index.html";
   const filePath = path.normalize(path.join(ROOT, p));
-  if (!filePath.startsWith(ROOT)) { res.writeHead(403); return res.end(); }
+  if (!filePath.startsWith(ROOT)) return fail(res, 403, "FORBIDDEN", "Path traversal blocked.");
   fs.stat(filePath, (err, st) => {
-    if (err || st.isDirectory()) { res.writeHead(404, { "Content-Type": "text/plain" }); return res.end("404 Not Found"); }
+    if (err || st.isDirectory()) return fail(res, 404, "NOT_FOUND", "Resource not found.");
     const ext = path.extname(filePath).toLowerCase();
     res.writeHead(200, {
       "Content-Type": MIME[ext] || "application/octet-stream",
-      "Cache-Control": "public, max-age=300"
+      "Cache-Control": ext === ".html" ? "no-cache" : "public, max-age=300"
     });
     fs.createReadStream(filePath).pipe(res);
   });
 }
 
-/* ---------------- server ---------------- */
+/* ---------------- router ---------------- */
+const API_ROUTES = {
+  "/api/status":                 { handler: hStatus,   limit: 30 },
+  "/api/ping":                   { handler: hPing,     limit: 240 },
+  "/api/diagnostics/server":     { handler: hServer,   limit: 30 },
+  "/api/diagnostics/metrics":    { handler: hMetrics,  limit: 120 },
+  "/api/server/metrics":         { handler: hMetrics,  limit: 120 },
+  "/api/diagnostics/network":    { handler: hNetwork,  limit: 20 },
+  "/api/diagnostics/dns":        { handler: hDns,      limit: 10 },
+  "/api/diagnostics/database":   { handler: hDatabase, limit: 10 }
+};
+
 const server = http.createServer(async (req, res) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "no-referrer");
 
-  const url = req.url;
-
-  if (url.startsWith("/api/diagnostics/")) {
-    res.setHeader("Access-Control-Allow-Origin", location_origin_of(req));
-    if (!rateLimit(req, res, 60, 10000)) return;
-    try {
-      switch (url.split("?")[0]) {
-        case "/api/diagnostics/server": return await handleServerInfo(req, res);
-        case "/api/diagnostics/live": return await handleLive(req, res);
-        case "/api/diagnostics/ip": return sendJSON(res, 200, { ip: clientIpOf(req), source: req.headers["cf-connecting-ip"] ? "cdn header" : "socket" });
-        case "/api/diagnostics/dns": return await handleDNS(req, res);
-        case "/api/diagnostics/database": return await handleDatabase(req, res);
-        default: return sendJSON(res, 404, { error: "unknown endpoint" });
-      }
-    } catch (e) {
-      return sendJSON(res, 500, { error: "internal error" });
-    }
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, OPTIONS",
+      "Access-Control-Max-Age": "86400"
+    });
+    return res.end();
+  }
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    return fail(res, 405, "METHOD_NOT_ALLOWED", "Only GET is supported.");
   }
 
-  serveStatic(req, res, url);
+  const routeBase = req.url.split("?")[0];
+  const route = API_ROUTES[routeBase];
+  if (route) {
+    if (!rateLimit(req, res, route.limit)) return;
+    try {
+      return await route.handler(req, res);
+    } catch (e) {
+      console.error("[api]", routeBase, e.message);
+      return fail(res, 500, "INTERNAL_ERROR", "Unable to complete diagnostics request.");
+    }
+  }
+  serveStatic(req, res, req.url);
 });
-
-function clientIpOf(req) {
-  const h = req.headers;
-  const cand = h["cf-connecting-ip"] || h["x-real-ip"] || (h["x-forwarded-for"] || "").split(",")[0].trim();
-  return cand || (req.socket.remoteAddress || "").replace("::ffff:", "") || null;
-}
-function location_origin_of(req) {
-  return "*";
-}
 
 server.listen(PORT, () => {
   console.log("");
-  console.log("  JUAN WEB LAB — diagnostics backend running");
+  console.log("  JUAN WEB LAB v" + VERSION + " — diagnostics backend running");
   console.log(`  http://localhost:${PORT}`);
+  console.log("");
   console.log("  Endpoints:");
-  console.log("   /api/diagnostics/server   /live   /ip   /dns   /database");
+  Object.keys(API_ROUTES).forEach(r => console.log("   GET " + r));
+  console.log("");
   console.log("  No secrets, credentials or environment variables are exposed.");
   console.log("");
 });

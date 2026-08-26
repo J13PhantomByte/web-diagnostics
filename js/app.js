@@ -1,72 +1,375 @@
 "use strict";
 
-const $ = (s) => document.querySelector(s);
-const $$ = (s) => document.querySelectorAll(s);
-const NA = "NOT AVAILABLE";
-const state = { results: {}, serverApi: false, headers: null, score: null };
+/* ================================================================
+   JUAN WEB LAB v2 — Diagnostic Engine
+   Every test returns a consistent structure and runs in isolation.
+   One failing/timeout test NEVER stops the rest of the suite.
+   ================================================================ */
 
-/* ---------------- helpers ---------------- */
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => Array.from(document.querySelectorAll(s));
+const NA = "NOT AVAILABLE";
+
+/* ---------------- global state ---------------- */
+const state = {
+  headers: null,
+  serverData: null,
+  backendOk: false,
+  lcp: null,
+  tbt: 0,
+  inp: null,
+  serverOffsetMs: null,
+  latencySamples: [],
+  cpuHistory: [],
+  currentRun: null
+};
+
+const Engine = {
+  results: new Map(),
+  controllers: new Set(),
+  running: false,
+  cancelled: false,
+  runId: null,
+  runStartedAt: null,
+  runDurationMs: null
+};
+
+const Cleanup = {
+  intervals: [],
+  observers: [],
+  streams: [],
+  addInterval(id) { Cleanup.intervals.push(id); return id; },
+  addObserver(o) { Cleanup.observers.push(o); return o; },
+  addStream(s) { Cleanup.streams.push(s); return s; },
+  all() {
+    Cleanup.intervals.forEach(clearInterval);
+    Cleanup.observers.forEach(o => { try { o.disconnect(); } catch {} });
+    Cleanup.streams.forEach(s => { try { s.getTracks().forEach(t => t.stop()); } catch {} });
+    Cleanup.intervals = []; Cleanup.observers = []; Cleanup.streams = [];
+  }
+};
+window.addEventListener("pagehide", () => { Cleanup.all(); stopCamera(); stopMic(); });
+
+/* ---------------- tiny utils ---------------- */
+function esc(t) { const d = document.createElement("div"); d.textContent = String(t ?? ""); return d.innerHTML; }
 function fmtBytes(b) {
-  if (b == null || isNaN(b)) return NA;
+  const n = Number(b);
+  if (!isFinite(n) || n == null) return NA;
   const u = ["B", "KB", "MB", "GB", "TB"];
-  let i = 0, n = Number(b);
-  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
-  return n.toFixed(n >= 100 || i === 0 ? 0 : 1) + " " + u[i];
+  let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + " " + u[i];
 }
-function fmtMs(ms) { return ms == null || isNaN(ms) ? NA : Math.round(ms) + " ms"; }
+function fmtMs(ms) { const n = Number(ms); return isFinite(n) ? Math.round(n) + " ms" : NA; }
 function fmtSec(s) {
-  if (s == null || isNaN(s)) return NA;
-  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  const n = Number(s);
+  if (!isFinite(n)) return NA;
+  const d = Math.floor(n / 86400), h = Math.floor((n % 86400) / 3600), m = Math.floor((n % 3600) / 60);
   return (d ? d + "d " : "") + (h ? h + "h " : "") + m + "m";
 }
-function esc(t) { const d = document.createElement("div"); d.textContent = String(t ?? ""); return d.innerHTML; }
-
 function toast(msg, kind = "") {
-  const el = document.createElement("div");
-  el.className = "toast " + kind;
-  el.textContent = msg;
-  $("#toastWrap").appendChild(el);
-  setTimeout(() => { el.style.opacity = "0"; el.style.transition = "opacity .3s"; setTimeout(() => el.remove(), 320); }, 3200);
+  try {
+    const el = document.createElement("div");
+    el.className = "toast " + kind;
+    el.textContent = msg;
+    $("#toastWrap").appendChild(el);
+    setTimeout(() => { el.style.opacity = "0"; el.style.transition = "opacity .3s"; setTimeout(() => el.remove(), 320); }, 3600);
+  } catch {}
 }
 
-function statusClass(v) { return v === true ? "st-green" : v === "warn" ? "st-yellow" : v === false ? "st-red" : "st-gray"; }
-function dotHtml(st) {
-  const c = st === true ? "dot-green" : st === "warn" ? "dot-yellow" : st === false ? "dot-red" : "dot-gray";
-  return `<span class="status-dot ${c}"></span>`;
+function unsupportedErr(msg) { const e = new Error(msg || "NOT SUPPORTED"); e.unsupported = true; return e; }
+
+/* ---------------- API client (contract aware) ---------------- */
+async function api(path, { timeout = 6000, signal } = {}) {
+  const ctrl = new AbortController();
+  Engine.controllers.add(ctrl);
+  const relay = () => ctrl.abort();
+  if (signal) signal.addEventListener("abort", relay, { once: true });
+  const timer = setTimeout(() => ctrl.abort(new DOMException("TIMEOUT", "TimeoutError")), timeout);
+  try {
+    let resp;
+    try { resp = await fetch(path, { signal: ctrl.signal, cache: "no-store" }); }
+    catch (e) {
+      if (e?.name === "TimeoutError") { const te = new Error("TIMEOUT"); te.code = "TIMEOUT"; throw te; }
+      const ne = new Error("Network unreachable"); ne.code = "NETWORK"; throw ne;
+    }
+    let j;
+    try { j = await resp.json(); }
+    catch { const e = new Error("Invalid JSON response (HTTP " + resp.status + ")"); e.code = "BAD_JSON"; throw e; }
+    if (j && j.success === false) {
+      const e = new Error(j.error?.message || "Request failed");
+      e.code = j.error?.code || "API_ERROR";
+      throw e;
+    }
+    return j?.data !== undefined ? j.data : j;
+  } finally {
+    clearTimeout(timer);
+    Engine.controllers.delete(ctrl);
+    if (signal) signal.removeEventListener("abort", relay);
+  }
 }
 
-function renderRows(containerSel, rows) {
-  const box = $(containerSel);
+/* ================================================================
+   DIAGNOSTIC ENGINE CORE
+   ================================================================ */
+function makeResult(id, name, category, weight) {
+  return { id, name, category, status: "idle", duration: 0, value: null, unit: null, details: null, error: null, weight: weight || 5 };
+}
+
+/**
+ * Runs a single test with timeout + abort isolation.
+ * fn(signal) may be sync or async. Throw unsupportedErr() for unsupported.
+ * Never throws — always resolves to a result object.
+ */
+async function runTest(id, name, category, fn, { timeout = 8000, weight = 5 } = {}) {
+  const res = makeResult(id, name, category, weight);
+  const ctrl = new AbortController();
+  Engine.controllers.add(ctrl);
+  const t0 = performance.now();
+  let timer = null;
+  try {
+    const work = Promise.resolve().then(() => fn(ctrl.signal));
+    const guard = new Promise((_, rej) => {
+      timer = setTimeout(() => {
+        try { ctrl.abort(); } catch {}
+        const e = new Error("TIMEOUT"); e.code = "TIMEOUT"; rej(e);
+      }, timeout);
+    });
+    const val = await Promise.race([work, guard]);
+    if (val && typeof val === "object" && ["passed", "warning", "failed", "unsupported"].includes(val.__status)) {
+      res.status = val.__status;
+      res.details = val.details ?? null;
+      res.error = val.error ?? null;
+    } else {
+      res.status = "passed";
+      res.value = val;
+    }
+  } catch (e) {
+    if (e?.code === "TIMEOUT") { res.status = "failed"; res.error = "TIMEOUT"; }
+    else if (e?.name === "AbortError") { res.status = Engine.cancelled ? "cancelled" : "failed"; res.error = Engine.cancelled ? "CANCELLED" : "ABORTED"; }
+    else if (e?.unsupported) { res.status = "unsupported"; res.error = e.message; }
+    else { res.status = "failed"; res.error = e?.message || String(e); }
+  } finally {
+    clearTimeout(timer);
+    Engine.controllers.delete(ctrl);
+    res.duration = Math.round(performance.now() - t0);
+  }
+  Engine.results.set(id, res);
+  return res;
+}
+
+/* ---------------- module registry ---------------- */
+const MODULES = {
+  client:      { title: "Client Detection",        timeout: 5000 },
+  server:      { title: "Server Diagnostics",      timeout: 6000 },
+  network:     { title: "Network Diagnostics",     timeout: 12000 },
+  http:        { title: "HTTP Diagnostics",        timeout: 10000 },
+  tls:         { title: "TLS / SSL Check",         timeout: 5000 },
+  dns:         { title: "DNS Diagnostics",         timeout: 12000 },
+  browser:     { title: "Browser Capability Test", timeout: 15000 },
+  storage:     { title: "Storage Diagnostics",     timeout: 10000 },
+  performance: { title: "Performance Diagnostics", timeout: 6000 },
+  database:    { title: "Database Diagnostics",    timeout: 6000 },
+  jsengine:    { title: "JavaScript Engine",       timeout: 8000 },
+  edge:        { title: "Edge / CDN Detection",    timeout: 10000 },
+  webserver:   { title: "Web Server Detection",    timeout: 10000 },
+  clock:       { title: "Server Clock Sync",       timeout: 6000 }
+};
+
+const FULL_ORDER   = ["client", "server", "network", "http", "tls", "dns", "browser", "storage", "performance", "database"];
+const QUICK_ORDER  = ["client", "network", "http", "performance"];
+const SERVER_ONLY  = new Set(["server", "network", "http", "tls", "dns", "edge", "webserver", "clock", "database"]);
+
+function summarizeStatus(results) {
+  const order = { failed: 4, warning: 3, passed: 2, unsupported: 1 };
+  let worst = "passed", anyUnsupportedOnly = true, n = 0;
+  for (const r of results) {
+    if (["cancelled", "idle"].includes(r.status)) continue;
+    n++;
+    if (order[r.status] > order[worst]) worst = r.status;
+    if (r.status !== "unsupported") anyUnsupportedOnly = false;
+  }
+  if (n === 0) return "idle";
+  return anyUnsupportedOnly ? "unsupported" : worst;
+}
+function moduleResults(cat) { return [...Engine.results.values()].filter(r => r.category === cat); }
+
+function setStateBadge(key, status) {
+  const el = $("#state-" + key);
+  if (!el) return;
+  el.dataset.state = status;
+  el.textContent = status.toUpperCase();
+}
+
+function showSkeleton(sel) { const b = $(sel); if (b) b.innerHTML = '<div class="skeleton"></div>'; }
+
+function renderRowsInto(sel, rows) {
+  const box = $(sel);
+  if (!box) return;
   box.innerHTML = rows.map(([k, v]) => {
-    const isStatus = typeof v === "object" && v !== null && v.__status;
-    const val = isStatus ? `${dotHtml(v.st)} <span class="status ${statusClass(v.st)}">${esc(v.text)}</span>` : esc(v);
+    const isSt = v && typeof v === "object" && v.__rowStatus;
+    const cls = isSt ? ({ passed: "st-green", warning: "st-yellow", failed: "st-red", unsupported: "st-gray" }[v.st] || "st-gray") : "";
+    const dotCol = { passed: "dot-green", warning: "dot-yellow", failed: "dot-red", unsupported: "dot-gray", idle: "dot-gray" }[isSt ? v.st : ""] || "dot-gray";
+    const val = isSt
+      ? `<span class="status-dot ${dotCol}"></span> <span class="status ${cls}">${esc(v.text)}</span>`
+      : esc(v);
     return `<div class="row"><span class="k">${esc(k)}</span><span class="v ${v === NA ? "na" : ""}">${val}</span></div>`;
   }).join("");
 }
-const ST = (text, st) => ({ __status: true, text, st });
+const RS = (text, st) => ({ __rowStatus: true, text, st });
 
-async function fetchJSON(url, timeoutMs = 6000) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const r = await fetch(url, { signal: ctrl.signal, cache: "no-store" });
-    if (!r.ok) return null;
-    return await r.json();
-  } catch { return null; } finally { clearTimeout(t); }
+function renderErrorInto(sel, title, msg, retryAttr) {
+  const box = $(sel);
+  if (!box) return;
+  box.innerHTML =
+    `<div class="err-box" role="alert">` +
+    `<div class="err-title">⚠ ${esc(title)}</div>` +
+    `<div class="err-msg">${esc(msg)}</div>` +
+    `<button class="btn btn-small btn-outline" data-module-run="${esc(retryAttr || "")}">RETRY</button>` +
+    `</div>`;
 }
 
-/* ---------------- nav ---------------- */
-$("#navToggle").addEventListener("click", () => {
-  const open = $("#mainNav").classList.toggle("open");
-  $("#navToggle").setAttribute("aria-expanded", open);
-});
-$$("#mainNav a").forEach(a => a.addEventListener("click", () => {
-  $("#mainNav").classList.remove("open");
-  $("#navToggle").setAttribute("aria-expanded", "false");
-}));
+/* ================================================================
+   CHART UTILITIES — never blank: loading / empty / error states
+   ================================================================ */
+const chartData = new Map();
 
-/* ---------------- client device ---------------- */
-function detectBrowser(ua) {
+function chartOverlay(box, kind, title, sub) {
+  if (!box) return;
+  let ov = box.querySelector(".chart-overlay");
+  if (kind === "ok") { if (ov) ov.remove(); return; }
+  if (!ov) {
+    ov = document.createElement("div");
+    ov.className = "chart-overlay";
+    ov.innerHTML = "<div></div><span></span>";
+    box.appendChild(ov);
+  }
+  ov.className = "chart-overlay " + (kind === "empty" ? "chart-empty" : kind === "error" ? "chart-error" : "chart-loading");
+  ov.children[0].textContent = title;
+  ov.children[1].textContent = sub || "";
+  ov.classList.remove("hidden");
+}
+
+function validNumbers(arr) {
+  if (!Array.isArray(arr)) return [];
+  return arr.map(Number).filter(n => Number.isFinite(n));
+}
+function validBars(items) {
+  if (!Array.isArray(items)) return [];
+  return items.filter(it => it && typeof it.label === "string" && Number.isFinite(Number(it.value)));
+}
+
+function setupCanvas(canvas) {
+  const box = canvas.parentElement;
+  const rect = box.getBoundingClientRect();
+  const w = Math.max(60, Math.floor(rect.width));
+  const h = Math.max(60, Math.floor(rect.height));
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.floor(w * dpr);
+  canvas.height = Math.floor(h * dpr);
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w, h };
+}
+
+function drawLineChart(canvasId, rawValues, { maxOverride } = {}) {
+  const canvas = document.getElementById(canvasId);
+  const box = canvas?.parentElement;
+  if (!canvas || !box) return;
+  const values = validNumbers(rawValues);
+  chartData.set(canvasId, { type: "line", values });
+  if (!values.length) { chartOverlay(box, "empty", "NO DATA AVAILABLE", "Run the test to collect metrics."); return; }
+  chartOverlay(box, "ok");
+  let env;
+  try { env = setupCanvas(canvas); } catch { chartOverlay(box, "error", "RENDER ERROR", "Canvas unavailable."); return; }
+  const { ctx, w, h } = env;
+  const padL = 34, padR = 10, padT = 12, padB = 18;
+  const iw = w - padL - padR, ih = h - padT - padB;
+  const max = maxOverride || Math.max(100, ...values);
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.font = "9px " + getComputedStyle(document.body).fontFamily;
+  ctx.strokeStyle = "#1c2230";
+  ctx.fillStyle = "#5b6474";
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = padT + (ih * i) / 4;
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+    ctx.fillText(String(Math.round(max - (max * i) / 4)), 4, y + 3);
+  }
+  const px = i => values.length === 1 ? padL + iw / 2 : padL + (iw * i) / (values.length - 1);
+  const py = v => padT + ih - (Math.min(v, max) / max) * ih;
+
+  ctx.strokeStyle = "#22d3ee";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  values.forEach((v, i) => { i ? ctx.lineTo(px(i), py(v)) : ctx.moveTo(px(i), py(v)); });
+  ctx.stroke();
+
+  ctx.fillStyle = "#22d3ee";
+  values.forEach((v, i) => { ctx.beginPath(); ctx.arc(px(i), py(v), 2.5, 0, Math.PI * 2); ctx.fill(); });
+
+  const last = values[values.length - 1];
+  ctx.fillStyle = "#dfe5ee";
+  ctx.fillText("last: " + Math.round(last), w - padR - 52, padT + 8);
+  ctx.fillStyle = "#5b6474";
+  ctx.fillText("t-" + (values.length - 1), padL, h - 5);
+  ctx.fillText("now", w - padR - 18, h - 5);
+}
+
+function drawBarChartH(canvasId, rawItems, unit = "ms") {
+  const canvas = document.getElementById(canvasId);
+  const box = canvas?.parentElement;
+  if (!canvas || !box) return;
+  const items = validBars(rawItems);
+  chartData.set(canvasId, { type: "bar", items, unit });
+  if (!items.length) { chartOverlay(box, "empty", "NO DATA AVAILABLE", "Metrics appear once measured."); return; }
+  chartOverlay(box, "ok");
+  let env;
+  try { env = setupCanvas(canvas); } catch { chartOverlay(box, "error", "RENDER ERROR", "Canvas unavailable."); return; }
+  const { ctx, w, h } = env;
+  ctx.clearRect(0, 0, w, h);
+  const max = Math.max(...items.map(i => i.value), 1);
+  const rowH = Math.min(30, (h - 16) / items.length);
+  ctx.font = "10px " + getComputedStyle(document.body).fontFamily;
+  items.forEach((it, i) => {
+    const y = 10 + i * ((h - 20) / items.length);
+    const bw = Math.max(2, ((w - 190) * it.value) / max);
+    ctx.fillStyle = "#1c2230";
+    ctx.fillRect(90, y, w - 190, rowH * 0.55);
+    ctx.fillStyle = "#22d3ee";
+    ctx.fillRect(90, y, bw, rowH * 0.55);
+    ctx.fillStyle = "#8b94a6";
+    ctx.fillText(it.label.toUpperCase().slice(0, 14), 6, y + rowH * 0.42);
+    ctx.fillStyle = "#dfe5ee";
+    ctx.fillText(Math.round(it.value) + " " + unit, 96 + bw + 6 > w - 60 ? w - 62 : 96 + bw + 6, y + rowH * 0.42);
+  });
+}
+
+const resizeObs = new ResizeObserver(entries => {
+  for (const entry of entries) {
+    const canvas = entry.target.querySelector("canvas");
+    if (!canvas || !chartData.has(canvas.id)) continue;
+    const d = chartData.get(canvas.id);
+    if (d.type === "line" && d.values.length) drawLineChart(canvas.id, d.values);
+    if (d.type === "bar" && d.items.length) drawBarChartH(canvas.id, d.items, d.unit);
+  }
+});
+$$(".chart-box").forEach(b => { try { resizeObs.observe(b); } catch {} });
+window.addEventListener("resize", () => {
+  clearTimeout(window.__rszT);
+  window.__rszT = setTimeout(() => {
+    for (const [id, d] of chartData) {
+      if (d.type === "line" && d.values.length) drawLineChart(id, d.values);
+      if (d.type === "bar" && d.items.length) drawBarChartH(id, d.items, d.unit);
+    }
+  }, 150);
+});
+
+/* ================================================================
+   MODULE: CLIENT DEVICE
+   ================================================================ */
+function detectBrowserInfo(ua) {
   const tests = [
     ["Edge", /Edg(?:e|A|iOS)?\/([\d.]+)/],
     ["Opera", /(?:OPR|Opera)\/([\d.]+)/],
@@ -81,753 +384,1025 @@ function detectBrowser(ua) {
   }
   return { name: "Unknown", version: NA };
 }
-function detectOS(ua) {
+function detectOSName(ua) {
   const map = [
     [/Windows NT 10/, "Windows 10/11"], [/Windows NT 6\.3/, "Windows 8.1"], [/Windows NT 6\.1/, "Windows 7"],
-    [/Android ([\d.]+)/, "Android"], [/(?:iPhone|iPad|iPod).*OS ([\d_]+)/, "iOS"], [/Mac OS X ([\d_.]+)/, "macOS"],
+    [/Android ([\d.]+)/], [/(?:iPhone|iPad|iPod).*OS ([\d_]+)/], [/Mac OS X ([\d_.]+)/],
     [/CrOS/, "ChromeOS"], [/Linux/, "Linux"]
   ];
-  for (const [re, name] of map) {
+  for (const [re, fixed] of map) {
     const m = ua.match(re);
-    if (m) return m[1] ? name.split(" ")[0] + " " + String(m[1]).replace(/_/g, ".") : name;
+    if (m) return fixed ? fixed.replace("_", " ") : m[0].split(" ").map(p => p.includes("/") ? p.split("/")[0] : p).join(" ");
   }
   return "Unknown";
 }
 function deviceType() {
   const ua = navigator.userAgent;
   if (/iPad|Tablet|PlayBook|Silk/i.test(ua) || (/Android/i.test(ua) && !/Mobile/i.test(ua))) return "Tablet";
-  if (/Mobi|iPhone|iPod|Android.*Mobile|Windows Phone/i.test(ua)) return "Mobile";
-  const coarse = matchMedia("(pointer:coarse)").matches;
-  if (coarse && Math.min(screen.width, screen.height) >= 600) return "Tablet";
-  return coarse ? "Mobile" : "Desktop";
+  if (/Mobi|iPhone|iPod|Windows Phone/i.test(ua)) return "Mobile";
+  if (matchMedia("(pointer:coarse)").matches) return Math.min(screen.width, screen.height) >= 600 ? "Tablet" : "Mobile";
+  return "Desktop";
 }
-function engineOf(browser) {
-  if (/Safari/.test(navigator.userAgent) && browser === "Safari") return "WebKit";
-  if (["Chrome", "Edge", "Opera", "Samsung Internet"].includes(browser)) return "Blink";
-  if (browser === "Firefox") return "Gecko";
-  if (browser === "Safari") return "WebKit";
-  return "Unknown";
+function clientInfo() {
+  const n = navigator;
+  const br = detectBrowserInfo(n.userAgent);
+  const conn = n.connection || n.mozConnection || n.webkitConnection;
+  return {
+    deviceType: deviceType(),
+    os: detectOSName(n.userAgent),
+    browser: br.name,
+    version: br.version,
+    engine: /Firefox/i.test(n.userAgent) ? "Gecko" : (/Safari/.test(n.userAgent) && !/Chrom|Edg|OPR/.test(n.userAgent) ? "WebKit" : /Chrom|Edg|OPR/.test(n.userAgent) ? "Blink" : "Unknown"),
+    screen: screen.width + " × " + screen.height,
+    pixelRatio: window.devicePixelRatio,
+    colorDepth: screen.colorDepth + "-bit",
+    touch: ("ontouchstart" in window || n.maxTouchPoints > 0) ? "Supported (" + (n.maxTouchPoints || "?") + ")" : "Not supported",
+    cores: n.hardwareConcurrency != null ? n.hardwareConcurrency : null,
+    memory: n.deviceMemory != null ? n.deviceMemory + " GB" : null,
+    language: n.language || NA,
+    platform: (n.userAgentData && n.userAgentData.platform) || n.platform || NA,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || NA,
+    darkMode: matchMedia("(prefers-color-scheme: dark)").matches,
+    reducedMotion: matchMedia("(prefers-reduced-motion: reduce)").matches,
+    ua: n.userAgent,
+    connType: conn?.type || null,
+    effType: conn?.effectiveType || null
+  };
 }
 
-function runClientDetection() {
-  const n = navigator;
-  const browser = detectBrowser(n.userAgent);
-  const conn = n.connection || n.mozConnection || n.webkitConnection;
-  state.results.client = {
-    deviceType: deviceType(), os: detectOS(n.userAgent),
-    browser: browser.name, browserVersion: browser.version, engine: engineOf(browser.name),
-    userAgent: n.userAgent,
-    screen: `${screen.width} × ${screen.height}`, viewport: `${innerWidth} × ${innerHeight}`,
-    pixelRatio: devicePixelRatio, colorDepth: screen.colorDepth + "-bit",
-    touch: ("ontouchstart" in window || n.maxTouchPoints > 0) ? "Supported (" + (n.maxTouchPoints || "?") + " points)" : "Not supported",
-    cpuCores: n.hardwareConcurrency ? n.hardwareConcurrency + " cores" : NA,
-    memory: n.deviceMemory ? n.deviceMemory + " GB" : NA,
-    online: n.onLine, language: n.language, platform: n.userAgentData?.platform || n.platform || NA,
-    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || NA,
-    darkMode: matchMedia("(prefers-color-scheme: dark)").matches ? "Dark preferred" : "Light preferred",
-    reducedMotion: matchMedia("(prefers-reduced-motion: reduce)").matches ? "Enabled" : "No preference",
-    connectionType: conn?.type || NA,
-    effectiveType: conn?.effectiveType || NA
-  };
-  const c = state.results.client;
-  renderRows("#clientData", [
-    ["Device Type", c.deviceType], ["Operating System", c.os],
-    ["Browser", c.browser], ["Browser Version", c.browserVersion],
-    ["Engine", c.engine], ["Platform", c.platform],
-    ["Screen", c.screen], ["Viewport", c.viewport],
-    ["Pixel Ratio", c.pixelRatio], ["Color Depth", c.colorDepth],
-    ["Touch", c.touch], ["CPU Cores", c.cpuCores],
-    ["Device Memory", c.memory], ["Online", ST(c.online ? "ONLINE" : "OFFLINE", c.online)],
-    ["Language", c.language], ["Timezone", c.timezone],
-    ["Color Scheme", c.darkMode], ["Reduced Motion", c.reducedMotion],
-    ["User Agent", c.userAgent]
+async function runClientTests() {
+  const info = await runTest("client-gather", "Client environment detection", "client", () => clientInfo(), { timeout: 4000, weight: 6 });
+  const c = info.status === "passed" ? info.value : clientInfo();
+  renderRowsInto("#body-client", [
+    ["Device Type", c.deviceType],
+    ["Operating System", c.os],
+    ["Browser", c.browser],
+    ["Browser Version", c.version],
+    ["Engine", c.engine],
+    ["Platform", c.platform],
+    ["Screen", c.screen],
+    ["Pixel Ratio", String(c.pixelRatio)],
+    ["Color Depth", c.colorDepth],
+    ["Touch", c.touch],
+    ["CPU Cores", c.cores != null ? c.cores + " logical" : NA],
+    ["Device Memory", c.memory || NA],
+    ["Language", c.language],
+    ["Timezone", c.timezone],
+    ["Online", RS(state.isOnline ? "ONLINE" : "OFFLINE", state.isOnline ? "passed" : "failed")],
+    ["Color Scheme", c.darkMode ? "Dark preferred" : "Light preferred"],
+    ["Reduced Motion", c.reducedMotion ? "Enabled" : "No preference"],
+    ["User Agent", c.ua]
+  ]);
+  updateViewportPanel();
+  return info;
+}
+
+/* ---- live viewport ---- */
+let vpTimer = null;
+function updateViewportPanel() {
+  const orient = innerWidth >= innerHeight ? "Landscape" : "Portrait";
+  renderRowsInto("#viewportData", [
+    ["Viewport", innerWidth + " × " + innerHeight],
+    ["Screen", screen.width + " × " + screen.height],
+    ["DPR", String(window.devicePixelRatio)],
+    ["Orientation", orient],
+    ["Available Screen", (screen.availWidth || NA) + " × " + (screen.availHeight || NA)],
+    ["Visual Viewport", window.visualViewport ? Math.round(visualViewport.width) + " × " + Math.round(visualViewport.height) : NA]
   ]);
 }
+window.addEventListener("resize", () => { clearTimeout(vpTimer); vpTimer = setTimeout(updateViewportPanel, 150); });
+window.addEventListener("orientationchange", () => setTimeout(updateViewportPanel, 300));
 
-addEventListener("resize", () => {
-  const row = $$('#clientData .row .v');
-  if (state.results.client) { /* viewport refresh */ }
-});
+/* ================================================================
+   MODULE: SERVER
+   ================================================================ */
+async function runServerTests() {
+  const res = await runTest("server-probe", "Backend server information", "server", async () => {
+    if (!navigator.onLine) { const e = new Error("NETWORK OFFLINE"); e.code = "OFFLINE"; throw e; }
+    return api("/api/diagnostics/server", { timeout: 6000 });
+  }, { timeout: 7000, weight: 12 });
 
-/* ---------------- network ---------------- */
-async function runNetworkPanel() {
-  const n = navigator;
-  const conn = n.connection || n.mozConnection || n.webkitConnection;
-
-  let clientIp = NA, ipSource = "";
-  const apiIp = await fetchJSON("/api/diagnostics/ip");
-  if (apiIp?.ip) { clientIp = apiIp.ip; ipSource = "server"; state.serverApi = true; }
-  else {
-    try {
-      const r = await fetch("https://api.ipify.org?format=json", { signal: AbortSignal.timeout(5000), cache: "no-store" });
-      const j = await r.json();
-      if (j.ip) { clientIp = j.ip; ipSource = "public api"; }
-    } catch {}
+  if (res.status !== "passed") {
+    state.serverData = null;
+    const reason = res.error === "TIMEOUT" ? "Request timed out." :
+      res.error === "NETWORK" || res.error === "NETWORK OFFLINE" ? "The diagnostics backend cannot be reached." : res.error;
+    renderRowsInto("#body-server", [["Server API", RS("UNAVAILABLE", "failed")], ["Hostname", NA], ["OS", NA], ["Kernel", NA], ["CPU", NA], ["RAM", NA]]);
+    renderRowsInto("#osData", [["Distribution", NA], ["Version", NA], ["Kernel", NA], ["Architecture", NA], ["Boot Time", NA], ["Virtualization", NA]]);
+    $("#body-server").insertAdjacentHTML("beforeend",
+      `<div class="warn-box">FRONTEND ONLINE — SERVER DIAGNOSTICS UNAVAILABLE.<br>${esc(reason)}<br>Deploy <b>node server.js</b> on your VPS to enable this panel.</div>`);
+    $("#liveIndicator").textContent = "● OFFLINE";
+    $("#liveIndicator").className = "live-indicator";
+    return res;
   }
 
-  state.results.network = {
-    clientIp, ipv6: NA, connectionType: conn?.type || NA,
-    effectiveType: conn?.effectiveType ? conn.effectiveType.toUpperCase() : NA,
-    downlink: conn?.downlink != null ? conn.downlink + " Mbps" : NA,
-    rtt: conn?.rtt != null ? conn.rtt + " ms" : NA,
-    saveData: conn?.saveData != null ? (conn.saveData ? "ON" : "OFF") : NA,
-    online: n.onLine
-  };
-  renderRows("#networkData", [
-    ["Client IP", state.results.network.clientIp + (ipSource ? ` (${ipSource})` : "")],
-    ["IPv4", /^\d+\.\d+\.\d+\.\d+$/.test(clientIp) ? clientIp : NA],
-    ["IPv6", clientIp.includes(":") ? clientIp : NA],
-    ["Online Status", ST(state.results.network.online ? "ONLINE" : "OFFLINE", state.results.network.online)],
-    ["Connection Type", state.results.network.connectionType],
-    ["Effective Type", state.results.network.effectiveType],
-    ["Downlink", state.results.network.downlink],
-    ["RTT (est.)", state.results.network.rtt],
-    ["Save Data", state.results.network.saveData]
+  const d = res.value;
+  state.serverData = d;
+  renderRowsInto("#body-server", [
+    ["Server IP", d.serverIp || NA],
+    ["Hostname", d.hostname || NA],
+    ["Operating System", d.os || NA],
+    ["Kernel", d.kernel || NA],
+    ["Architecture", d.architecture || NA],
+    ["CPU Model", d.cpuModel || NA],
+    ["CPU Cores", d.cpuCores != null ? String(d.cpuCores) : NA],
+    ["Memory Total", d.memoryTotal != null ? fmtBytes(d.memoryTotal) : NA],
+    ["Memory Used", d.memoryUsed != null ? fmtBytes(d.memoryUsed) + (d.memoryPct != null ? " (" + d.memoryPct + "%)" : "") : NA],
+    ["Disk Total", d.diskTotal != null ? fmtBytes(d.diskTotal) : NA],
+    ["Disk Used", d.diskUsed != null ? fmtBytes(d.diskUsed) + (d.diskPct != null ? " (" + d.diskPct + "%)" : "") : NA],
+    ["Load Average", Array.isArray(d.loadAverage) ? d.loadAverage.join(" / ") : NA],
+    ["Uptime", d.uptime != null ? fmtSec(d.uptime) : NA],
+    ["Timezone", d.timezone || NA],
+    ["Server Time", d.serverTime || NA],
+    ["Virtualization", d.virtualization || NA],
+    ["Container", d.container || NA],
+    ["Server Status", RS("ONLINE", "passed")]
   ]);
+  renderRowsInto("#osData", [
+    ["Distribution", d.os || NA],
+    ["Version", d.osVersion || NA],
+    ["Kernel", d.kernel || NA],
+    ["Architecture", d.architecture || NA],
+    ["Hostname", d.hostname || NA],
+    ["Boot Time", d.bootTime || NA],
+    ["Uptime", d.uptime != null ? fmtSec(d.uptime) : NA],
+    ["Virtualization", d.virtualization || NA]
+  ]);
+  startLiveMonitor();
+  return res;
+}
+
+/* ---------------- live metrics polling ---------------- */
+let liveFails = 0;
+async function pollMetrics() {
+  const box = $("#liveData");
+  try {
+    const d = await api("/api/diagnostics/metrics", { timeout: 4000 });
+    liveFails = 0;
+    $("#liveIndicator").textContent = "● LIVE";
+    $("#liveIndicator").className = "live-indicator on";
+    const bar = (label, pct) => {
+      const p = Number(pct);
+      const f = isFinite(p) ? Math.max(0, Math.min(10, Math.round(p / 10))) : 0;
+      return `${label.padEnd(5)}<span class="live-bar-fill">${"█".repeat(f)}</span><span class="live-bar-rest">${"░".repeat(10 - f)}</span> ${isFinite(p) ? p : "?"}%`;
+    };
+    box.innerHTML = `<div class="live-bars">${bar("CPU", d.cpuPct)}\n${bar("RAM", d.memPct)}\n${bar("DISK", d.diskPct)}\nLOAD    ${d.load1 ?? NA}    UPTIME ${fmtSec(d.uptime)}</div>`;
+    if (Number.isFinite(Number(d.cpuPct))) {
+      state.cpuHistory.push(Number(d.cpuPct));
+      if (state.cpuHistory.length > 60) state.cpuHistory.shift();
+      drawLineChart("cpuChart", state.cpuHistory, { maxOverride: 100 });
+    }
+  } catch (e) {
+    liveFails++;
+    if (liveFails >= 2) {
+      stopLiveMonitor();
+      $("#liveIndicator").textContent = "● OFFLINE";
+      $("#liveIndicator").className = "live-indicator";
+      box.innerHTML = `<div class="chart-state chart-error">SERVER METRICS UNAVAILABLE<br><span>Lost connection to the diagnostics backend. Press RUN on the Server panel to reconnect.</span></div>`;
+      chartOverlay($("#cpuChartBox"), "empty", "NO DATA AVAILABLE", "Backend metrics stream stopped.");
+    }
+  }
+}
+let liveTimer = null;
+function startLiveMonitor() {
+  if (liveTimer) return;
+  $("#liveIndicator").textContent = "● LIVE";
+  $("#liveIndicator").className = "live-indicator on";
+  pollMetrics();
+  liveTimer = Cleanup.addInterval(setInterval(pollMetrics, 3000));
+}
+function stopLiveMonitor() { if (liveTimer) { clearInterval(liveTimer); liveTimer = null; } }
+
+/* ================================================================
+   MODULE: NETWORK + LATENCY
+   ================================================================ */
+async function runNetworkTests() {
+  const online = navigator.onLine;
+  state.isOnline = online;
+  const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+
+  const connRes = await runTest("net-conn", "Connection information", "network", () => {
+    if (!conn) throw unsupportedErr("Network Information API not exposed by this browser");
+    return { type: conn.type || null, eff: conn.effectiveType || null, downlink: conn.downlink ?? null, rtt: conn.rtt ?? null, saveData: !!conn.saveData };
+  }, { timeout: 2000, weight: 4 });
+
+  const cv = connRes.status === "passed" ? connRes.value : {};
+  const ipRes = await runTest("net-ip", "Client IP lookup", "network", async () => {
+    if (!online) { const e = new Error("NETWORK OFFLINE"); e.code = "OFFLINE"; throw e; }
+    return api("/api/diagnostics/network", { timeout: 6000 });
+  }, { timeout: 7000, weight: 6 });
+
+  const latRes = await runLatencyTest();
+
+  renderRowsInto("#body-network", [
+    ["Online Status", RS(online ? "ONLINE" : "OFFLINE", online ? "passed" : "failed")],
+    ["Client IP", ipRes.status === "passed" ? ipRes.value.ip || NA : RS(ipRes.error === "NETWORK OFFLINE" ? "UNAVAILABLE (OFFLINE)" : ipRes.status === "unsupported" ? "REQUIRES SERVER ENDPOINT" : ipRes.error || "FAILED", ipRes.status === "passed" ? "passed" : "warning")],
+    ["IPv4", ipRes.status === "passed" && /^\d+\.\d+\.\d+\.\d+$/.test(ipRes.value.ip || "") ? ipRes.value.ip : NA],
+    ["IPv6", ipRes.status === "passed" && (ipRes.value.ip || "").includes(":") ? ipRes.value.ip : NA],
+    ["Connection Type", cv.type || NA],
+    ["Effective Type", cv.eff ? cv.eff.toUpperCase() : NA],
+    ["Downlink", cv.downlink != null ? cv.downlink + " Mbps" : NA],
+    ["RTT (est.)", cv.rtt != null ? cv.rtt + " ms" : NA],
+    ["Save Data", conn ? (cv.saveData ? "ON" : "OFF") : NA],
+    ["Median Latency", state.latencySamples.length ? fmtMs(median(state.latencySamples)) : NA]
+  ]);
+  updateHealth("NETWORK", latRes.status === "passed" ? (median(state.latencySamples) < 500 ? "GOOD" : "FAIR") : "POOR", median(state.latencySamples) < 700 ? "passed" : "warning");
+  return connRes;
+}
+
+function median(a) { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; }
+
+async function pingOnce() {
+  const t0 = performance.now();
+  try {
+    await fetch("/api/ping?t=" + Date.now(), { cache: "no-store", signal: AbortSignal.timeout(2800) });
+    return performance.now() - t0;
+  } catch {
+    const t1 = performance.now();
+    await fetch(location.pathname + "?_ping=" + Date.now(), { cache: "no-store", signal: AbortSignal.timeout(2800) });
+    return performance.now() - t1;
+  }
 }
 
 async function runLatencyTest() {
-  renderRows("#latencyData", [["Status", "Running…"]]);
+  const rows = $("#latencyData");
   $("#latencyVerdict").innerHTML = "";
-  const samples = [];
-  for (let i = 0; i < 5; i++) {
+  if (rows) rows.innerHTML = '<div class="muted">Measuring… sending 8 sequential requests.</div>';
+  chartOverlay($("#latencyChartBox"), "loading", "MEASURING…", "Collecting real response times.");
+
+  state.latencySamples = [];
+  let failures = 0;
+  const res = await runTest("net-latency", "Latency measurement (8 requests)", "network", async (signal) => {
+    for (let i = 0; i < 8; i++) {
+      if (signal.aborted || Engine.cancelled) break;
+      try {
+        const ms = await pingOnce();
+        state.latencySamples.push(ms);
+      } catch { failures++; }
+      renderRowsInto("#latencyData", [
+        ["Requests Done", (i + 1) + " / 8"],
+        ["Successful", String(state.latencySamples.length)],
+        ["Failed", String(failures)],
+        ["Last Response", state.latencySamples.length ? fmtMs(state.latencySamples[state.latencySamples.length - 1]) : NA],
+        ["Best So Far", state.latencySamples.length ? fmtMs(Math.min(...state.latencySamples)) : NA],
+        ["Median So Far", state.latencySamples.length ? fmtMs(median(state.latencySamples)) : NA]
+      ]);
+      drawLineChart("latencyChart", state.latencySamples);
+    }
+    if (!state.latencySamples.length) { const e = new Error("NETWORK TEST FAILED — no successful responses"); e.code = "NO_RESPONSE"; throw e; }
+    return true;
+  }, { timeout: 25000, weight: 8 });
+
+  if (res.status === "passed" || state.latencySamples.length) {
+    const med = median(state.latencySamples);
+    const best = Math.min(...state.latencySamples);
+    const q = med < 100 ? ["EXCELLENT", "passed"] : med < 300 ? ["GOOD", "passed"] : med < 700 ? ["FAIR", "warning"] : ["POOR", "failed"];
+    renderRowsInto("#latencyData", [
+      ["Requests Successful", state.latencySamples.length + " / 8"],
+      ["Failed Requests", String(failures)],
+      ["Median Response", fmtMs(med)],
+      ["Best Response", fmtMs(best)],
+      ["Worst Response", fmtMs(Math.max(...state.latencySamples))],
+      ["All Samples", state.latencySamples.map(v => Math.round(v)).join(" · ") + " ms"]
+    ]);
+    $("#latencyVerdict").innerHTML = `QUALITY&nbsp;&nbsp;<span class="status ${q[2]}">● ${q[0]}</span>`;
+    chartOverlay($("#latencyChartBox"), "ok");
+    drawLineChart("latencyChart", state.latencySamples);
+    res.status = q[1] === "warning" ? "warning" : res.status;
+  } else if (rows) {
+    renderRowsInto("#latencyData", [["Latency Test", RS("NETWORK TEST FAILED", "failed")], ["Detail", res.error || NA]]);
+    chartOverlay($("#latencyChartBox"), "error", "NETWORK TEST FAILED", res.error || "No successful responses.");
+  }
+  return res;
+}
+
+/* ================================================================
+   MODULE: HTTP (+ webserver + edge derivation)
+   ================================================================ */
+function cdnFromHeaders(h) {
+  if (h["cf-ray"] || h["cf-cache-status"]) return "Cloudflare";
+  if (h["x-amz-cf-id"]) return "CloudFront";
+  if (h["x-served-by"]?.includes("cache") || h["x-fastly-request-id"]) return "Fastly";
+  if (h["x-vercel-id"] || h["x-vercel-cache"]) return "Vercel";
+  if (h["x-nf-request-id"]) return "Netlify";
+  if (h["via"]) return "Proxy: " + h["via"];
+  return null;
+}
+
+async function runHttpTests() {
+  $("#httpTerminal").textContent = `$ GET ${location.pathname}\nHost: ${location.host}\n→ sending…`;
+
+  const res = await runTest("http-request", "HTTP request analysis", "http", async () => {
     const t0 = performance.now();
-    try {
-      await fetch(location.pathname + "?_lat=" + Date.now() + "&i=" + i, { cache: "no-store", signal: AbortSignal.timeout(8000) });
-      samples.push(performance.now() - t0);
-    } catch {}
-  }
-  if (!samples.length) {
-    renderRows("#latencyData", [["Server Response", ST("FAILED — NO RESPONSE", false)]]);
-    $("#latencyVerdict").innerHTML = `<span class="st-red">● POOR</span>`;
-    return;
-  }
-  samples.sort((a, b) => a - b);
-  const median = samples[Math.floor(samples.length / 2)];
-  const best = samples[0];
+    const resp = await fetch(location.href, { method: "GET", cache: "no-store" });
+    await resp.arrayBuffer();
+    const elapsed = performance.now() - t0;
+    const headers = {};
+    resp.headers.forEach((v, k) => { headers[k.toLowerCase()] = v; });
+    const nav = performance.getEntriesByType ? performance.getEntriesByType("navigation")[0] : null;
+    return { status: resp.status, ok: resp.ok, statusText: resp.statusText, elapsed, headers, protocol: nav?.nextHopProtocol || "unknown" };
+  }, { timeout: 10000, weight: 10 });
 
-  let phases = {};
-  const nav = performance.getEntriesByType("navigation")[0];
-  if (nav) {
-    phases = {
-      dns: nav.domainLookupEnd - nav.domainLookupStart,
-      tcp: nav.connectEnd - nav.connectStart,
-      tls: nav.requestStart - nav.secureConnectionStart > 0 ? nav.requestStart - nav.secureConnectionStart : null,
-      ttfb: nav.responseStart - nav.requestStart,
-      download: nav.responseEnd - nav.responseStart,
-      total: nav.responseEnd - nav.startTime
-    };
+  if (res.status !== "passed") {
+    $("#httpTerminal").textContent = "$ GET /\n→ REQUEST FAILED: " + (res.error || "unknown error");
+    renderRowsInto("#body-http", [["HTTP Request", RS("FAILED", "failed")], ["Error", res.error || NA]]);
+    return res;
   }
 
-  state.results.latency = { median, best, ...phases, samples: samples.map(Math.round) };
-  const q = median < 100 ? ["EXCELLENT", true] : median < 300 ? ["GOOD", true] : median < 700 ? ["FAIR", "warn"] : ["POOR", false];
-  renderRows("#latencyData", [
-    ["Server Response (median)", fmtMs(median)],
-    ["Best Sample", fmtMs(best)],
-    ...(phases.dns != null ? [["DNS", fmtMs(phases.dns)], ["TCP", fmtMs(phases.tcp)]] : []),
-    ...(phases.tls != null ? [["TLS Handshake", fmtMs(phases.tls)]] : []),
-    ...(phases.ttfb != null ? [["TTFB", fmtMs(phases.ttfb)], ["Download", fmtMs(phases.download)], ["Total Nav Time", fmtMs(phases.total)]] : []),
-    ["Samples", samples.map(Math.round).join(" · ") + " ms"]
-  ]);
-  $("#latencyVerdict").innerHTML = `QUALITY&nbsp;&nbsp;<span class="status ${statusClass(q[1])}">● ${q[0]}</span>`;
-  state.results.network.quality = q[0];
-  updateHealthRow("NETWORK", ST(q[0] === "POOR" ? "POOR" : "GOOD", q[1]));
-}
-
-/* ---------------- server info via API ---------------- */
-async function loadServerInfo() {
-  const data = await fetchJSON("/api/diagnostics/server");
-  state.results.serverApiOk = !!data;
-  if (!data) {
-    renderRows("#serverData", [["Server API", ST("NOT REACHABLE", "warn")], ["Hostname", NA], ["OS", NA], ["Kernel", NA], ["CPU Model", NA], ["Uptime", NA]]);
-    renderRows("#osData", [["Distribution", NA], ["Version", NA], ["Kernel", NA], ["Architecture", NA], ["Boot Time", NA], ["Virtualization", NA]]);
-    $("#serverBadge").textContent = "API OFFLINE";
-    $("#liveIndicator").textContent = "● OFFLINE"; $("#liveIndicator").className = "live-indicator";
-    return;
-  }
-  state.serverApi = true;
-  state.results.server = data;
-  renderRows("#serverData", [
-    ["Server IP", data.ip || NA],
-    ["Hostname", data.hostname || NA],
-    ["Operating System", data.os || NA],
-    ["Kernel", data.kernel || NA],
-    ["Architecture", data.arch || NA],
-    ["CPU Model", data.cpuModel || NA],
-    ["CPU Cores", data.cpuCores || NA],
-    ["CPU Usage", data.cpuUsage != null ? data.cpuUsage + "%" : NA],
-    ["RAM Total", data.memTotal ? fmtBytes(data.memTotal) : NA],
-    ["RAM Used", data.memUsed != null ? fmtBytes(data.memUsed) + " (" + data.memPct + "%)" : NA],
-    ["RAM Free", data.memFree != null ? fmtBytes(data.memFree) : NA],
-    ["Disk Total", data.diskTotal ? fmtBytes(data.diskTotal) : NA],
-    ["Disk Used", data.diskUsed != null ? fmtBytes(data.diskUsed) + " (" + data.diskPct + "%)" : NA],
-    ["Disk Free", data.diskFree != null ? fmtBytes(data.diskFree) : NA],
-    ["Load Average", data.loadavg ? data.loadavg.join(" / ") : NA],
-    ["Uptime", data.uptime != null ? fmtSec(data.uptime) : NA],
-    ["Timezone", data.timezone || NA],
-    ["Server Date/Time", data.datetime || NA],
-    ["Virtualization", data.virtualization || NA],
-    ["Container", data.container || NA],
-    ["Server Status", ST("ONLINE", true)]
-  ]);
-  renderRows("#osData", [
-    ["Distribution", data.osDist || data.os || NA],
-    ["Version", data.osVersion || NA],
-    ["Kernel", data.kernel || NA],
-    ["Architecture", data.arch || NA],
-    ["Hostname", data.hostname || NA],
-    ["Boot Time", data.bootTime || NA],
-    ["Uptime", data.uptime != null ? fmtSec(data.uptime) : NA],
-    ["Virtualization", data.virtualization || NA]
-  ]);
-  updateHealthRow("SERVER", ST("ONLINE", true));
-  if (state.headers) renderWebServerPanel(state.headers, state.results.http?.protocol || "unknown");
-  startLiveMonitor();
-}
-
-let liveTimer = null, cpuHistory = [];
-async function pollLive() {
-  const d = await fetchJSON("/api/diagnostics/live");
-  const box = $("#liveData");
-  if (!d) { clearInterval(liveTimer); $("#liveIndicator").textContent = "● OFFLINE"; $("#liveIndicator").className = "live-indicator"; return; }
-  $("#liveIndicator").textContent = "● LIVE"; $("#liveIndicator").className = "live-indicator on";
-  const bar = (label, pct, suffix) => {
-    const f = Math.round(pct / 10);
-    return `<span class="k">${label.padEnd(5)}</span> <span class="live-bar-fill">${"█".repeat(f)}</span><span class="live-bar-rest">${"░".repeat(10 - f)}</span> ${pct}${suffix}`;
-  };
-  box.innerHTML = `<div class="live-bars">${bar("CPU", d.cpuPct ?? 0, "%")}\n${bar("RAM", d.memPct ?? 0, "%")}\n${bar("DISK", d.diskPct ?? 0, "%")}\nLOAD     ${d.load1 ?? NA}   UPTIME ${fmtSec(d.uptime)}</div>`;
-  cpuHistory.push(d.cpuPct ?? 0);
-  if (cpuHistory.length > 60) cpuHistory.shift();
-  drawLiveChart();
-}
-function drawLiveChart() {
-  const cv = $("#liveChart");
-  const ctx = cv.getContext("2d");
-  const w = cv.width = cv.clientWidth * devicePixelRatio;
-  const h = cv.height = 90 * devicePixelRatio;
-  ctx.clearRect(0, 0, w, h);
-  ctx.strokeStyle = "#232a38"; ctx.beginPath();
-  [0.25, 0.5, 0.75].forEach(f => { ctx.moveTo(0, h * f); ctx.lineTo(w, h * f); }); ctx.stroke();
-  if (cpuHistory.length < 2) return;
-  ctx.strokeStyle = "#22d3ee"; ctx.lineWidth = 2 * devicePixelRatio; ctx.beginPath();
-  cpuHistory.forEach((v, i) => {
-    const x = (i / (cpuHistory.length - 1)) * w;
-    const y = h - (v / 100) * h;
-    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
-  });
-  ctx.stroke();
-}
-function startLiveMonitor() {
-  if (liveTimer) return;
-  $("#liveIndicator").textContent = "● LIVE"; $("#liveIndicator").className = "live-indicator on";
-  pollLive();
-  liveTimer = setInterval(pollLive, 3000);
-}
-
-/* ---------------- web server + http ---------------- */
-async function runHttpDiagnostics() {
-  $("#httpHost").textContent = location.host;
-  const nav = performance.getEntriesByType("navigation")[0];
-  const protocol = nav?.nextHopProtocol || "unknown";
-  let resp;
-  const t0 = performance.now();
-  try {
-    resp = await fetch(location.href, { method: "GET", cache: "no-store" });
-  } catch (e) {
-    renderRows("#httpData", [["Request", ST("FAILED", false)]]);
-    $("#httpTerminal").textContent = "$ GET /\n→ request failed: " + e.message;
-    return;
-  }
-  const elapsed = performance.now() - t0;
-  const headers = {};
-  resp.headers.forEach((v, k) => { headers[k.toLowerCase()] = v; });
+  const { status, ok: isOk, statusText, elapsed, headers, protocol } = res.value;
   state.headers = headers;
-  state.results.http = { protocol, statusCode: resp.status, elapsed, headers };
 
-  $("#httpTerminal").innerHTML =
+  $("#httpTerminal").textContent =
     `$ GET ${location.pathname} HTTP\n` +
-    `Host: ${esc(location.host)}\n` +
-    `User-Agent: JUAN-WEB-LAB/1.0\n\n` +
-    `← HTTP ${resp.status} ${resp.statusText || ""}\n` +
-    `protocol: ${esc(protocol)}\n` +
-    `time: ${Math.round(elapsed)} ms`;
+    `Host: ${location.host}\n` +
+    `User-Agent: JUAN-WEB-LAB/2.0\n\n` +
+    `← HTTP ${status} ${statusText || ""}\n` +
+    `protocol: ${protocol.toUpperCase()}\n` +
+    `total time: ${Math.round(elapsed)} ms`;
 
-  renderRows("#httpData", [
-    ["Status Code", ST(`${resp.status} ${resp.statusText || ""}`.trim(), resp.ok ? true : resp.status < 500 ? "warn" : false)],
-    ["HTTP Protocol", protocol !== "unknown" ? protocol.toUpperCase() : NA],
+  renderRowsInto("#body-http", [
+    ["Status Code", RS(`${status} ${(statusText || "").trim()}`, isOk ? "passed" : status < 500 ? "warning" : "failed")],
+    ["HTTP Protocol", protocol !== "unknown" ? protocol.toUpperCase() : "LIMITED BY BROWSER"],
     ["Content-Type", headers["content-type"] || NA],
     ["Content-Encoding", headers["content-encoding"] || "none (identity)"],
     ["Cache-Control", headers["cache-control"] || NA],
     ["ETag", headers["etag"] || NA],
-    ["Server", headers["server"] || NA],
-    ["Date (header)", headers["date"] || NA],
-    ["Content-Length", headers["content-length"] || "(chunked)"],
+    ["Server Header", headers["server"] || NA],
+    ["Date Header", headers["date"] || NA],
+    ["Content-Length", headers["content-length"] || "(chunked / unknown)"],
     ["Response Time", fmtMs(elapsed)]
   ]);
-  $("#httpHeaders").textContent = Object.entries(headers).map(([k, v]) => k + ": " + v).join("\n") || "(headers not exposed)";
+  const hdrEl = $("#httpHeaders");
+  if (hdrEl) hdrEl.textContent = Object.entries(headers).map(([k, v]) => k + ": " + v).join("\n") || "(headers not exposed by server)";
 
-  renderWebServerPanel(headers, protocol);
-  renderEdgePanel(headers);
-  renderSslPanel(headers, protocol);
-  renderClockFromHeaders(headers.date);
-}
-
-function renderWebServerPanel(h, protocol) {
-  const api = state.results.server || {};
-  let compression = "none detected";
-  if (h["content-encoding"]) compression = h["content-encoding"].toUpperCase();
-  renderRows("#webServerData", [
-    ["Web Server", h["server"] || api.serverSoftware || NA],
-    ["Server Version", h["server"]?.match(/[\d.]+/)?.[0] || NA],
-    ["PHP Version", api.phpVersion || NA],
-    ["Node.js Version", api.nodeVersion || NA],
-    ["Python Version", api.pythonVersion || NA],
-    ["Database Software", api.database || NA],
+  /* derived: web server panel */
+  const enc = headers["content-encoding"] || "";
+  renderRowsInto("#body-webserver", [
+    ["Web Server", headers["server"] || (state.serverData ? "Node.js (backend direct)" : NA)],
+    ["Version", headers["server"]?.match(/[\d.]+/)?.[0] || "DETECTED · VERSION UNKNOWN"],
+    ["PHP Version", NA],
+    ["Node.js Version", state.serverData ? "backend runtime" : NA],
     ["HTTP Protocol", protocol !== "unknown" ? protocol.toUpperCase() : NA],
-    ["TLS Version", api.tlsVersion || (h["strict-transport-security"] ? "secure (HSTS active)" : NA)],
-    ["OpenSSL", api.openssl || NA],
-    ["Framework", api.framework || NA],
-    ["Reverse Proxy", h["x-proxy"] || h["via"] || (h["x-powered-by"] ? "possible (x-powered-by present)" : NA)],
-    ["CDN", cdnFromHeaders(h) || NA],
-    ["Compression", compression],
-    ["Gzip", /gzip/i.test(compression) ? ST("ENABLED", true) : ST("NOT DETECTED", "gray")],
-    ["Brotli", /br/i.test(compression) ? ST("ENABLED", true) : ST("NOT DETECTED", "gray")]
+    ["TLS Version", headers["strict-transport-security"] ? "secure (HSTS active)" : NA],
+    ["Compression", enc ? enc.toUpperCase() : "NOT DETECTED"],
+    ["Gzip", /gzip/i.test(enc) ? RS("ENABLED", "passed") : RS("NOT DETECTED", "unsupported")],
+    ["Brotli", /br\b/i.test(enc) ? RS("ENABLED", "passed") : RS("NOT DETECTED", "unsupported")]
   ]);
-}
 
-function cdnFromHeaders(h) {
-  if (h["cf-ray"] || h["cf-cache-status"]) return "Cloudflare";
-  if (h["x-amz-cf-id"]) return "CloudFront";
-  if (h["x-fastly-request-id"] || h["x-served-by"]?.includes("cache")) return "Fastly";
-  if (h["x-vercel-id"] || h["x-vercel-cache"]) return "Vercel";
-  if (h["x-nf-request-id"]) return "Netlify";
-  if (h["x-sucuri-id"]) return "Sucuri";
-  if (h["x-arbiter"] || h["x-anypage"]) return "Unknown CDN";
-  if (h["via"]) return "Via: " + h["via"];
-  return null;
-}
-
-function renderEdgePanel(h) {
-  const cdn = cdnFromHeaders(h);
-  renderRows("#edgeData", [
-    ["CDN", cdn || "Unknown (direct origin likely)"],
-    ["Proxy / Reverse Proxy", h["via"] || h["x-proxy"] ? ST("DETECTED", true) : ST("UNKNOWN", "gray")],
-    ["Cache Status", h["cf-cache-status"] || h["x-vercel-cache"] || h["x-cache"] || NA],
-    ["Region / POP", h["cf-ray"] ? h["cf-ray"].split("-")[1] || NA : h["x-vercel-ip-city"] || NA],
-    ["Ray ID", h["cf-ray"] || h["x-amz-cf-id"] || NA],
-    ["Age", h["age"] ? h["age"] + "s" : NA]
+  /* derived: edge panel */
+  const cdn = cdnFromHeaders(headers);
+  renderRowsInto("#body-edge", [
+    ["CDN / Edge", cdn || "Unknown (direct origin likely)"],
+    ["Reverse Proxy", headers["via"] || headers["x-proxy"] ? RS("DETECTED", "passed") : RS("UNKNOWN", "unsupported")],
+    ["Cache Status", headers["cf-cache-status"] || headers["x-vercel-cache"] || headers["x-cache"] || NA],
+    ["Region / POP", headers["cf-ray"] ? (headers["cf-ray"].split("-")[1] || NA) : headers["x-vercel-ip-city"] || NA],
+    ["Ray / Trace ID", headers["cf-ray"] || headers["x-amz-cf-id"] || NA],
+    ["Age", headers["age"] ? headers["age"] + "s" : NA]
   ]);
+
+  applyClockOffset(headers.date);
+  return res;
 }
 
-/* ---------------- SSL ---------------- */
-function renderSslPanel(h, protocol) {
-  const https = location.protocol === "https:";
-  const api = state.results.server || {};
-  const hsts = h["strict-transport-security"];
-  let verdict = ST("UNKNOWN", "gray");
-  if (https && !mixedContent()) verdict = ST("SECURE", true);
-  else if (https) verdict = ST("⚠ WARNING — MIXED CONTENT", "warn");
-  else if (location.protocol === "file:") verdict = ST("N/A (FILE)", "gray");
-  else verdict = ST("✕ INSECURE (PLAIN HTTP)", false);
-
-  $("#sslVerdict").outerHTML = `<span class="badge badge-cyan" id="sslVerdict">${verdict.text}</span>`;
-  state.results.ssl = { https, tls: api.tlsVersion || null, hsts: !!hsts };
-  renderRows("#sslData", [
-    ["HTTPS Enabled", ST(https ? "YES" : "NO", https)],
-    ["TLS Version", api.tlsVersion || NA],
-    ["Certificate Issuer", api.certIssuer || NA],
-    ["Certificate Expires", api.certExpires || NA],
-    ["Secure Connection", ST(https ? "YES" : "NO", https)],
-    ["Mixed Content", mixedContent() ? ST("DETECTED", false) : ST("NONE", true)],
-    ["HSTS", hsts ? ST("ENABLED", true) : ST("NOT SET", "warn")],
-    ["HSTS Value", hsts || NA]
-  ]);
-  updateHealthRow("HTTPS", https ? ST("SECURE", true) : ST("INSECURE", false));
-}
-function mixedContent() {
+/* ================================================================
+   MODULE: TLS
+   ================================================================ */
+function hasMixedContent() {
   if (location.protocol !== "https:") return false;
-  return [...document.querySelectorAll("img[src], script[src], link[href]")].some(el => {
-    const u = el.src || el.href || "";
-    return u.startsWith("http://");
-  });
+  return $$("img[src], script[src], iframe[src]").some(el => (el.getAttribute("src") || "").startsWith("http://"));
 }
 
-/* ---------------- DNS ---------------- */
-async function runDnsTest() {
-  renderRows("#dnsData", [["Test", "Resolving…"]]);
-  const d = await fetchJSON("/api/diagnostics/dns");
-  if (!d || d.error) {
-    renderRows("#dnsData", [
-      ["Domain", location.hostname],
-      ["DNS Test", ST(d?.error ? d.error : "API NOT AVAILABLE", "gray")]
-    ]);
-    state.results.dns = { ok: false };
-    return;
-  }
-  state.results.dns = { ok: true, ...d };
-  renderRows("#dnsData", [
-    ["Domain", d.domain],
-    ["A Record", d.a?.join(", ") || NA],
-    ["AAAA Record", d.aaaa?.join(", ") || NA],
-    ["CNAME", d.cname || NA],
-    ["Nameservers", d.ns?.join(", ") || NA],
-    ["DNS Provider", d.provider || "Unknown"],
-    ["Resolution Time", fmtMs(d.resolveMs)]
+async function runTlsTests() {
+  const res = await runTest("tls-check", "TLS / HTTPS analysis", "tls", () => {
+    const https = location.protocol === "https:";
+    return { https, hsts: state.headers?.["strict-transport-security"] || null, mixed: hasMixedContent(), protocol: (performance.getEntriesByType("navigation")[0]?.nextHopProtocol || "unknown") };
+  }, { timeout: 3000, weight: 10 });
+
+  const v = res.status === "passed" ? res.value : { https: location.protocol === "https:", hsts: null, mixed: false, protocol: "unknown" };
+  let verdict, vst;
+  if (v.https && !v.mixed) { verdict = "SECURE"; vst = "passed"; }
+  else if (v.https) { verdict = "⚠ WARNING — MIXED CONTENT"; vst = "warning"; }
+  else if (location.protocol === "file:") { verdict = "N/A (FILE PROTOCOL)"; vst = "unsupported"; }
+  else { verdict = "✕ INSECURE (PLAIN HTTP)"; vst = "failed"; }
+
+  renderRowsInto("#body-tls", [
+    ["HTTPS Enabled", RS(v.https ? "YES" : "NO", v.https ? "passed" : "failed")],
+    ["Overall Verdict", RS(verdict, vst)],
+    ["Negotiated Protocol", v.protocol !== "unknown" ? v.protocol.toUpperCase() : "LIMITED BY BROWSER"],
+    ["TLS Version", "LIMITED BY BROWSER"],
+    ["Certificate Issuer", "LIMITED BY BROWSER"],
+    ["Certificate Expiry", "LIMITED BY BROWSER"],
+    ["Mixed Content", v.https ? (v.mixed ? RS("DETECTED", "failed") : RS("NONE FOUND", "passed")) : RS("N/A", "unsupported")],
+    ["HSTS Header", v.hsts ? RS("ENABLED", "passed") : RS("NOT SET", "warning")],
+    ["HSTS Value", v.hsts || NA]
   ]);
+  updateHealth("HTTPS", v.https ? "SECURE" : "INSECURE", vst);
+  return res;
 }
 
-/* ---------------- server clock ---------------- */
-let serverOffsetMs = null;
-function renderClockFromHeaders(dateHeader) {
-  if (!dateHeader) { $("#serverClock").textContent = NA; $("#clockOffset").textContent = UNKNOWN(); return; }
-  const serverMs = new Date(dateHeader).getTime();
-  const localAtResponse = performance.getEntriesByType("navigation")[0]?.responseStart ?? Date.now();
-  serverOffsetMs = serverMs - localAtResponse;
-  tickClock();
+/* ================================================================
+   MODULE: DNS
+   ================================================================ */
+async function runDnsTests() {
+  const res = await runTest("dns-resolve", "DNS record resolution", "dns", async () => {
+    if (!navigator.onLine) { const e = new Error("NETWORK OFFLINE"); e.code = "OFFLINE"; throw e; }
+    return api("/api/diagnostics/dns", { timeout: 11000 });
+  }, { timeout: 12000, weight: 8 });
+
+  if (res.status !== "passed") {
+    const msg = res.error === "TIMEOUT" ? "DNS LOOKUP FAILED — timed out"
+      : res.error === "NETWORK" ? "REQUIRES SERVER ENDPOINT — backend unreachable"
+      : res.error || "DNS LOOKUP FAILED";
+    renderRowsInto("#body-dns", [
+      ["Domain", location.hostname],
+      ["Result", RS(res.error === "NO_PUBLIC_DOMAIN" ? "NO PUBLIC DOMAIN TO RESOLVE" : msg, "warning")],
+      ["Note", res.error === "NETWORK" ? "The bundled backend performs real DNS lookups; deploy node server.js to enable." : NA]
+    ]);
+    return res;
+  }
+  const d = res.value;
+  renderRowsInto("#body-dns", [
+    ["Domain", d.domain],
+    ["A Records", d.a?.length ? d.a.join(", ") : NA],
+    ["AAAA Records", d.aaaa?.length ? d.aaaa.join(", ") : NA],
+    ["CNAME", d.cname || NA],
+    ["Nameservers", d.ns?.length ? d.ns.join(", ") : NA],
+    ["DNS Provider", d.provider || "Unknown"],
+    ["Resolution Time", d.resolveMs != null ? fmtMs(d.resolveMs) : NA],
+    ["Lookup Status", RS("SUCCESS", "passed")]
+  ]);
+  return res;
 }
-function UNKNOWN() { return NA; }
-setInterval(tickClock, 1000);
-function tickClock() {
-  const now = new Date();
-  $("#clientClock").textContent = now.toTimeString().slice(0, 8);
-  if (serverOffsetMs != null) {
-    $("#serverClock").textContent = new Date(Date.now() + serverOffsetMs).toTimeString().slice(0, 8);
-    const s = Math.round(serverOffsetMs / 1000);
-    $("#clockOffset").textContent = (s === 0 ? "±0" : (s > 0 ? "+" : "") + s) + " second" + (Math.abs(s) === 1 ? "" : "s");
+
+/* ================================================================
+   MODULE: BROWSER CAPABILITIES (real feature detection)
+   ================================================================ */
+function capResult(status, detail) { return { __cap: true, status, detail: detail || "" }; }
+
+async function runBrowserTests() {
+  const defs = [
+    ["JavaScript", () => capResult("SUPPORTED", "executing"), 3],
+    ["WebGL", async () => {
+      const c = document.createElement("canvas");
+      const gl = c.getContext("webgl") || c.getContext("experimental-webgl");
+      if (!gl) return capResult("NOT SUPPORTED");
+      let renderer = "context created";
+      try {
+        const ext = gl.getExtension("WEBGL_debug_renderer_info");
+        if (ext) renderer = gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || renderer;
+      } catch {}
+      return capResult("SUPPORTED", String(renderer).slice(0, 80));
+    }, 5],
+    ["WebGL2", () => {
+      const gl = document.createElement("canvas").getContext("webgl2");
+      return gl ? capResult("SUPPORTED", gl.getParameter(gl.VERSION) || "") : capResult("NOT SUPPORTED");
+    }, 4],
+    ["WebGPU", async () => {
+      if (!navigator.gpu) return capResult("NOT SUPPORTED");
+      const ad = await navigator.gpu.requestAdapter();
+      return ad ? capResult("SUPPORTED", "adapter acquired") : capResult("BLOCKED", "adapter unavailable");
+    }, 4],
+    ["WebAssembly", () => typeof WebAssembly === "object" && WebAssembly.validate ? capResult("SUPPORTED") : capResult("NOT SUPPORTED"), 4],
+    ["WebSocket", () => {
+      if (typeof WebSocket === "undefined") return capResult("NOT SUPPORTED");
+      try { const ws = new WebSocket("wss://localhost:1"); setTimeout(() => { try { ws.close(); } catch {} }, 0); return capResult("SUPPORTED"); }
+      catch { return capResult("BLOCKED"); }
+    }, 3],
+    ["Web Workers", () => typeof Worker === "undefined" ? capResult("NOT SUPPORTED") : (() => {
+      try { const w = new Worker(URL.createObjectURL(new Blob(["self.onmessage=()=>{}"]))); w.terminate(); return capResult("SUPPORTED"); }
+      catch { return capResult("BLOCKED"); }
+    })(), 3],
+    ["Service Worker", async () => {
+      if (!("serviceWorker" in navigator)) return capResult("NOT SUPPORTED");
+      try { await navigator.serviceWorker.getRegistrations(); return capResult("SUPPORTED"); }
+      catch { return capResult("BLOCKED", "insecure context likely"); }
+    }, 3],
+    ["IndexedDB", () => new Promise(resolve => {
+      if (!window.indexedDB) return resolve(capResult("NOT SUPPORTED"));
+      const rq = indexedDB.open("__jwl_cap", 1);
+      rq.onerror = () => resolve(capResult("BLOCKED"));
+      rq.onsuccess = () => { try { rq.result.close(); indexedDB.deleteDatabase("__jwl_cap"); } catch {} resolve(capResult("SUPPORTED")); };
+      setTimeout(() => resolve(capResult("ERROR", "open timeout")), 3000);
+    }), 3],
+    ["Fetch", () => typeof fetch === "function" ? capResult("SUPPORTED") : capResult("NOT SUPPORTED"), 3],
+    ["Streams", () => typeof ReadableStream !== "undefined" ? capResult("SUPPORTED") : capResult("NOT SUPPORTED"), 2],
+    ["Web Crypto", async () => {
+      if (!crypto?.subtle) return capResult("NOT SUPPORTED");
+      try { await crypto.subtle.digest("SHA-256", new TextEncoder().encode("test")); return capResult("SUPPORTED", "SHA-256 digest ok"); }
+      catch { return capResult("ERROR"); }
+    }, 3],
+    ["Notifications", () => "Notification" in window ? capResult("PERMISSION REQUIRED", Notification.permission) : capResult("NOT SUPPORTED"), 2],
+    ["Clipboard", () => navigator.clipboard ? capResult("PERMISSION REQUIRED") : capResult("NOT SUPPORTED"), 2],
+    ["Geolocation", () => navigator.geolocation ? capResult("PERMISSION REQUIRED") : capResult("NOT SUPPORTED"), 2],
+    ["Camera / Mic", () => navigator.mediaDevices?.getUserMedia ? capResult("PERMISSION REQUIRED") : capResult("NOT SUPPORTED"), 2],
+    ["Bluetooth", () => navigator.bluetooth ? capResult("PERMISSION REQUIRED") : capResult("NOT SUPPORTED"), 1],
+    ["USB", () => navigator.usb ? capResult("PERMISSION REQUIRED") : capResult("NOT SUPPORTED"), 1],
+    ["Gamepad", () => navigator.getGamepads ? capResult("SUPPORTED") : capResult("NOT SUPPORTED"), 1],
+    ["Web Audio", () => (window.AudioContext || window.webkitAudioContext) ? capResult("SUPPORTED") : capResult("NOT SUPPORTED"), 3],
+    ["Screen Capture", () => navigator.mediaDevices?.getDisplayMedia ? capResult("PERMISSION REQUIRED") : capResult("NOT SUPPORTED"), 2],
+    ["Cache Storage", () => window.caches ? capResult("SUPPORTED") : capResult("NOT SUPPORTED"), 2],
+    ["LocalStorage", () => { localStorage.setItem("__jwl_cap", "1"); const okv = localStorage.getItem("__jwl_cap") === "1"; localStorage.removeItem("__jwl_cap"); return okv ? capResult("SUPPORTED") : capResult("BLOCKED"); }, 3],
+    ["SessionStorage", () => { sessionStorage.setItem("__jwl_cap", "1"); const okv = sessionStorage.getItem("__jwl_cap") === "1"; sessionStorage.removeItem("__jwl_cap"); return okv ? capResult("SUPPORTED") : capResult("BLOCKED"); }, 3],
+    ["Cookies", () => {
+      if (!navigator.cookieEnabled) return capResult("BLOCKED");
+      document.cookie = "__jwl_cap=1; SameSite=Lax; path=/";
+      const okv = document.cookie.includes("__jwl_cap");
+      document.cookie = "__jwl_cap=; Max-Age=0; path=/";
+      return okv ? capResult("SUPPORTED") : capResult("BLOCKED");
+    }, 3]
+  ];
+
+  const results = [];
+  for (const [name, fn, weight] of defs) {
+    if (Engine.cancelled) break;
+    const r = await runTest("cap-" + name.toLowerCase().replace(/[^a-z0-9]+/g, "-"), name, "browser", fn, { timeout: 4000, weight });
+    const cap = r.value && r.value.__cap ? r.value : (r.status === "unsupported" ? capResult("NOT SUPPORTED", r.error) : capResult("ERROR", r.error || ""));
+    results.push({ name, status: cap.status, detail: cap.detail, duration: r.duration });
+    Engine.results.get(r.id).details = cap.status;
+  }
+
+  const clsMap = { "SUPPORTED": "st-green", "NOT SUPPORTED": "st-gray", "PERMISSION REQUIRED": "st-yellow", "BLOCKED": "st-yellow", "ERROR": "st-red" };
+  $("#capsSummary").textContent = results.filter(r => r.status === "SUPPORTED").length + " supported · " +
+    results.filter(r => r.status === "PERMISSION REQUIRED").length + " need permission · " +
+    results.filter(r => r.status === "NOT SUPPORTED").length + " unsupported · " +
+    results.filter(r => r.status === "ERROR" || r.status === "BLOCKED").length + " blocked/error";
+  $("#body-browser").innerHTML = `<div class="cap-grid">` + results.map(r =>
+    `<div class="cap-item" title="${esc(r.detail)}"><span>${esc(r.name)}</span><span class="cap-status ${clsMap[r.status] || "st-gray"}">${esc(r.status)}${r.duration ? " · " + r.duration + "ms" : ""}</span></div>`
+  ).join("") + `</div>
+  <p class="panel-desc" style="margin-top:10px">Hover a tile for detail. Camera, microphone and location have dedicated interactive tests below.</p>`;
+
+  updateHealth("BROWSER", "READY", "passed");
+  return results;
+}
+
+/* ================================================================
+   PERMISSION TESTS (camera / mic / geo) — user-initiated only
+   ================================================================ */
+let cameraStream = null, micStream = null, micAudioCtx = null, micRaf = 0;
+
+async function startCamera() {
+  const st = $("#cameraStatus");
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) { st.textContent = "UNAVAILABLE"; st.className = "v st-gray"; return; }
+    st.textContent = "REQUESTING…"; st.className = "v st-gray";
+    cameraStream = await navigator.mediaDevices.getUserMedia({ video: true });
+    Cleanup.addStream(cameraStream);
+    const video = $("#cameraVideo");
+    video.srcObject = cameraStream;
+    await video.play().catch(() => {});
+    $("#cameraBox").classList.remove("hidden");
+    $("#btnCameraStart").classList.add("hidden");
+    $("#btnCameraStop").classList.remove("hidden");
+    st.textContent = "GRANTED · LIVE PREVIEW"; st.className = "v st-green";
+  } catch (e) {
+    st.textContent = e.name === "NotAllowedError" ? "DENIED" : e.name === "NotFoundError" ? "NO DEVICE" : "ERROR";
+    st.className = "v " + (e.name === "NotAllowedError" ? "st-red" : "st-gray");
   }
 }
-
-/* ---------------- performance ---------------- */
-function runPerformancePanel() {
-  const p = performance.getEntriesByType("navigation")[0];
-  if (!p) { renderRows("#perfData", [["Performance API", NA]]); return; }
-  const paint = performance.getEntriesByType("paint");
-  const fp = paint.find(e => e.name === "first-paint")?.startTime;
-  const fcp = paint.find(e => e.name === "first-contentful-paint")?.startTime;
-  const res = performance.getEntriesByType("resource");
-  const byType = t => res.filter(r => r.initiatorType === t);
-  const sum = arr => arr.reduce((a, r) => a + (r.transferSize || 0), 0);
-
-  const rows = [
-    ["DOM Content Loaded", ((p.domContentLoadedEventEnd - p.startTime) / 1000).toFixed(2) + "s"],
-    ["Load Event", ((p.loadEventEnd - p.startTime) / 1000).toFixed(2) + "s"],
-    ["First Paint", fp != null ? (fp / 1000).toFixed(2) + "s" : NA],
-    ["First Contentful Paint", fcp != null ? (fcp / 1000).toFixed(2) + "s" : NA],
-    ["Largest Contentful Paint", state.results.lcp != null ? (state.results.lcp / 1000).toFixed(2) + "s" : NA],
-    ["INP / FID", state.results.inp != null ? state.results.inp + " ms" : NA],
-    ["Total Blocking Time", state.results.tbt != null ? state.results.tbt + " ms" : NA],
-    ["Resources", String(res.length)],
-    ["JS Transfer Size", fmtBytes(sum(byType("script")))],
-    ["CSS Transfer Size", fmtBytes(sum(res.filter(r => /\.css($|\?)/.test(new URL(r.name, location.href).pathname))))],
-    ["Image Transfer Size", fmtBytes(sum(byType("img")))],
-    ["Total Transfer Size", fmtBytes(p.transferSize + sum(res))],
-    ["Page Weight (decoded)", fmtBytes(p.decodedBodySize)]
-  ];
-  renderRows("#perfData", rows);
-  state.results.perf = { load: p.loadEventEnd - p.startTime, fcp, lcp: state.results.lcp };
-
-  const bar = $("#perfBar");
-  const loadSec = (p.loadEventEnd - p.startTime) / 1000;
-  bar.style.width = Math.min(100, Math.max(5, 100 - loadSec * 12)) + "%";
-
-  let v, cls;
-  if (loadSec < 1.5 && (fcp == null || fcp < 1800)) { v = "EXCELLENT"; cls = true; }
-  else if (loadSec < 3) { v = "GOOD"; cls = true; }
-  else if (loadSec < 6) { v = "FAIR"; cls = "warn"; }
-  else { v = "POOR"; cls = false; }
-  $("#perfVerdict").innerHTML = `PERFORMANCE&nbsp;&nbsp;<span class="status ${statusClass(cls)}">● ${v}</span>`;
-  updateHealthRow("PERFORMANCE", ST(v, cls));
+function stopCamera() {
+  try { cameraStream?.getTracks().forEach(t => t.stop()); } catch {}
+  const video = $("#cameraVideo");
+  if (video) video.srcObject = null;
+  cameraStream = null;
+  $("#cameraBox")?.classList.add("hidden");
+  $("#btnCameraStart")?.classList.remove("hidden");
+  $("#btnCameraStop")?.classList.add("hidden");
+  const st = $("#cameraStatus");
+  if (st && st.textContent.includes("LIVE")) { st.textContent = "STOPPED"; st.className = "v st-gray"; }
 }
 
+async function startMic() {
+  const st = $("#micStatus");
+  try {
+    if (!navigator.mediaDevices?.getUserMedia || !(window.AudioContext || window.webkitAudioContext)) { st.textContent = "UNAVAILABLE"; st.className = "v st-gray"; return; }
+    st.textContent = "REQUESTING…"; st.className = "v st-gray";
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    Cleanup.addStream(micStream);
+    const AC = window.AudioContext || window.webkitAudioContext;
+    micAudioCtx = new AC();
+    const src = micAudioCtx.createMediaStreamSource(micStream);
+    const analyser = micAudioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    src.connect(analyser);
+    const buf = new Uint8Array(analyser.frequencyBinCount);
+    $("#micBox").classList.remove("hidden");
+    $("#btnMicStart").classList.add("hidden");
+    $("#btnMicStop").classList.remove("hidden");
+    st.textContent = "GRANTED · MEASURING"; st.className = "v st-green";
+    const tick = () => {
+      analyser.getByteFrequencyData(buf);
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+      const rms = Math.sqrt(sum / buf.length);
+      const pct = Math.min(100, Math.round((rms / 128) * 100));
+      $("#micMeterFill").style.width = pct + "%";
+      $("#micLevelLabel").textContent = pct > 2 ? `MIC LEVEL — input detected (${pct}%)` : "MIC LEVEL — silence";
+      micRaf = requestAnimationFrame(tick);
+    };
+    cancelAnimationFrame(micRaf);
+    micRaf = requestAnimationFrame(tick);
+  } catch (e) {
+    st.textContent = e.name === "NotAllowedError" ? "DENIED" : e.name === "NotFoundError" ? "NO DEVICE" : "ERROR";
+    st.className = "v " + (e.name === "NotAllowedError" ? "st-red" : "st-gray");
+  }
+}
+function stopMic() {
+  cancelAnimationFrame(micRaf);
+  try { micStream?.getTracks().forEach(t => t.stop()); } catch {}
+  try { micAudioCtx?.close(); } catch {}
+  micStream = null; micAudioCtx = null;
+  $("#micBox")?.classList.add("hidden");
+  $("#micMeterFill").style.width = "0%";
+  $("#btnMicStart")?.classList.remove("hidden");
+  $("#btnMicStop")?.classList.add("hidden");
+  const st = $("#micStatus");
+  if (st && st.textContent.includes("MEASURING")) { st.textContent = "STOPPED"; st.className = "v st-gray"; }
+}
+
+function testGeolocation() {
+  const st = $("#geoStatus"), out = $("#geoResult");
+  if (!navigator.geolocation) { st.textContent = "UNAVAILABLE"; st.className = "v st-gray"; out.textContent = "Geolocation API not supported by this browser."; return; }
+  st.textContent = "PROMPTING…"; st.className = "v st-yellow";
+  out.textContent = "Waiting for permission…";
+  navigator.geolocation.getCurrentPosition(
+    pos => {
+      st.textContent = "GRANTED"; st.className = "v st-green";
+      out.textContent = `Lat ${pos.coords.latitude.toFixed(5)}, Lon ${pos.coords.longitude.toFixed(5)} ±${Math.round(pos.coords.accuracy)}m`;
+    },
+    err => {
+      st.textContent = err.code === 1 ? "DENIED" : err.code === 2 ? "UNAVAILABLE" : "TIMEOUT";
+      st.className = "v st-red";
+      out.textContent = "Location test failed: " + err.message;
+    },
+    { timeout: 12000, maximumAge: 0 }
+  );
+}
+
+$("#btnCameraStart").addEventListener("click", startCamera);
+$("#btnCameraStop").addEventListener("click", stopCamera);
+$("#btnMicStart").addEventListener("click", startMic);
+$("#btnMicStop").addEventListener("click", stopMic);
+$("#btnGeoTest").addEventListener("click", testGeolocation);
+
+/* ================================================================
+   MODULE: STORAGE
+   ================================================================ */
+async function runStorageTests() {
+  const out = [];
+
+  const cookieRes = await runTest("stor-cookie", "Cookies write/read/cleanup", "storage", () => {
+    document.cookie = "__jwl_st=1; SameSite=Lax; path=/";
+    const okv = document.cookie.includes("__jwl_st");
+    document.cookie = "__jwl_st=; Max-Age=0; path=/";
+    const cleaned = !document.cookie.includes("__jwl_st");
+    if (!okv) { const e = new Error("Cookie write blocked"); e.unsupported = true; throw e; }
+    return cleaned ? "writable, cleaned up" : "writable, cleanup uncertain";
+  }, { timeout: 2000, weight: 4 });
+  out.push(["Cookies", storRow(cookieRes)]);
+
+  const lsRes = await runTest("stor-local", "LocalStorage write/read/cleanup", "storage", () => {
+    localStorage.setItem("__jwl_st_" + Date.now(), "v");
+    const k = Object.keys(localStorage).find(k => k.startsWith("__jwl_st_"));
+    const okv = k && localStorage.getItem(k) === "v";
+    localStorage.removeItem(k);
+    return okv ? "writable, cleaned up" : "write failed";
+  }, { timeout: 2000, weight: 4 });
+  out.push(["LocalStorage", storRow(lsRes)]);
+
+  const ssRes = await runTest("stor-session", "SessionStorage write/read/cleanup", "storage", () => {
+    sessionStorage.setItem("__jwl_st_" + Date.now(), "v");
+    const k = Object.keys(sessionStorage).find(k => k.startsWith("__jwl_st_"));
+    const okv = k && sessionStorage.getItem(k) === "v";
+    sessionStorage.removeItem(k);
+    return okv ? "writable, cleaned up" : "write failed";
+  }, { timeout: 2000, weight: 4 });
+  out.push(["SessionStorage", storRow(ssRes)]);
+
+  const idbRes = await runTest("stor-idb", "IndexedDB open/write/cleanup", "storage", () => new Promise((resolve, reject) => {
+    if (!window.indexedDB) { reject(unsupportedErr("IndexedDB not available")); return; }
+    let db;
+    const rq = indexedDB.open("__jwl_storage_test", 1);
+    rq.onerror = () => reject(new Error("IndexedDB blocked"));
+    rq.onsuccess = () => {
+      db = rq.result;
+      try { db.close(); indexedDB.deleteDatabase("__jwl_storage_test"); } catch {}
+      resolve("opened, cleaned up");
+    };
+  }), { timeout: 5000, weight: 4 });
+  out.push(["IndexedDB", storRow(idbRes)]);
+
+  const cacheRes = await runTest("stor-cache", "Cache Storage write/read/cleanup", "storage", async () => {
+    if (!window.caches) throw unsupportedErr("Cache Storage not available");
+    const c = await caches.open("__jwl_cache_test");
+    await c.put("/__jwl_probe", new Response("ok"));
+    const hit = await c.match("/__jwl_probe");
+    await caches.delete("__jwl_cache_test");
+    return hit ? "writable, cleaned up" : "read-back failed";
+  }, { timeout: 5000, weight: 4 });
+  out.push(["Cache Storage", storRow(cacheRes)]);
+
+  const swRes = await runTest("stor-sw", "Service Worker registration", "storage", async () => {
+    if (!("serviceWorker" in navigator)) throw unsupportedErr("Service Worker API not available");
+    const regs = await navigator.serviceWorker.getRegistrations();
+    return regs.length ? regs.length + " registered" : "API available, none registered";
+  }, { timeout: 4000, weight: 3 });
+  out.push(["Service Worker", storRow(swRes)]);
+
+  renderRowsInto("#body-storage", out);
+  return cookieRes;
+}
+function storRow(r) {
+  if (r.status === "passed") return RS("PASS · " + (typeof r.value === "string" ? r.value : "ok") + ` (${r.duration}ms)`, "passed");
+  if (r.status === "unsupported") return RS("NOT SUPPORTED", "unsupported");
+  if (r.status === "warning") return RS("WARNING · " + r.error, "warning");
+  return RS("FAILED · " + (r.error || ""), "failed");
+}
+
+/* ================================================================
+   MODULE: PERFORMANCE (+ charts + resources)
+   ================================================================ */
 try {
   new PerformanceObserver(list => {
-    const e = list.getEntries();
-    state.results.lcp = e[e.length - 1].startTime;
+    const entries = list.getEntries();
+    if (entries.length) state.lcp = entries[entries.length - 1].startTime;
   }).observe({ type: "largest-contentful-paint", buffered: true });
 } catch {}
 
 try {
-  let tbt = 0;
   new PerformanceObserver(list => {
-    for (const e of list.getEntries()) if (e.duration > 50) tbt += e.duration - 50;
-    state.results.tbt = Math.round(tbt);
+    for (const e of list.getEntries()) if (e.duration > 50) state.tbt += e.duration - 50;
   }).observe({ type: "longtask", buffered: true });
 } catch {}
 
 try {
   new PerformanceObserver(list => {
-    for (const e of list.getEntries()) if (e.interactionId) state.results.inp = Math.round(e.duration);
+    for (const e of list.getEntries()) if (e.interactionId) state.inp = Math.round(Math.max(state.inp || 0, e.duration));
   }).observe({ type: "event", buffered: true, durationThreshold: 16 });
 } catch {}
 
-/* ---------------- capabilities ---------------- */
-function runCapabilityTests() {
-  const results = [];
-  const test = (name, fn) => {
-    try {
-      const r = fn();
-      results.push([name, r]);
-    } catch { results.push([name, "BLOCKED"]); }
-  };
+async function runPerformanceTests() {
+  const res = await runTest("perf-nav", "Navigation & paint timing", "performance", () => {
+    if (!performance.getEntriesByType) throw unsupportedErr("Performance Timeline not available");
+    const nav = performance.getEntriesByType("navigation")[0];
+    if (!nav) throw unsupportedErr("Navigation Timing not available");
+    const paint = performance.getEntriesByType("paint");
+    return {
+      ttfb: nav.responseStart - nav.requestStart,
+      dcl: nav.domContentLoadedEventEnd - nav.startTime,
+      load: nav.loadEventEnd > 0 ? nav.loadEventEnd - nav.startTime : null,
+      fp: paint.find(e => e.name === "first-paint")?.startTime ?? null,
+      fcp: paint.find(e => e.name === "first-contentful-paint")?.startTime ?? null,
+      transferSize: nav.transferSize ?? null,
+      decodedSize: nav.decodedBodySize ?? null
+    };
+  }, { timeout: 4000, weight: 10 });
 
-  test("JavaScript", () => ST("PASS", true));
-  test("WebGL", () => {
-    const c = document.createElement("canvas");
-    return c.getContext("webgl") || c.getContext("experimental-webgl") ? ST("PASS", true) : ST("NOT SUPPORTED", false);
-  });
-  test("WebGL2", () => document.createElement("canvas").getContext("webgl2") ? ST("PASS", true) : ST("NOT SUPPORTED", false));
-  test("WebGPU", () => navigator.gpu ? ST("PASS", true) : ST("NOT SUPPORTED", false));
-  test("WebAssembly", () => typeof WebAssembly === "object" ? ST("PASS", true) : ST("NOT SUPPORTED", false));
-  test("Web Workers", () => typeof Worker !== "undefined" ? ST("PASS", true) : ST("NOT SUPPORTED", false));
-  test("Service Workers", () => "serviceWorker" in navigator ? ST("PASS", true) : ST("NOT SUPPORTED", false));
-  test("IndexedDB", () => window.indexedDB ? ST("PASS", true) : ST("NOT SUPPORTED", false));
-  test("LocalStorage", () => { localStorage.setItem("_t", "1"); localStorage.removeItem("_t"); return ST("PASS", true); });
-  test("SessionStorage", () => { sessionStorage.setItem("_t", "1"); sessionStorage.removeItem("_t"); return ST("PASS", true); });
-  test("Cookies", () => {
-    if (!navigator.cookieEnabled) return ST("BLOCKED", false);
-    document.cookie = "_jwl=1; SameSite=Lax";
-    const ok = document.cookie.includes("_jwl");
-    document.cookie = "_jwl=; Max-Age=0";
-    return ok ? ST("PASS", true) : ST("BLOCKED", false);
-  });
-  test("WebSocket", () => typeof WebSocket !== "undefined" ? ST("PASS", true) : ST("NOT SUPPORTED", false));
-  test("Fetch API", () => typeof fetch === "function" ? ST("PASS", true) : ST("NOT SUPPORTED", false));
-  test("Streams API", () => typeof ReadableStream !== "undefined" ? ST("PASS", true) : ST("NOT SUPPORTED", false));
-  test("Web Crypto", () => crypto?.subtle ? ST("PASS", true) : ST("NOT SUPPORTED", false));
-  test("Notifications", () => "Notification" in window ? ST("PERMISSION REQUIRED", "warn") : ST("NOT SUPPORTED", false));
-  test("Clipboard", () => navigator.clipboard ? ST("PERMISSION REQUIRED", "warn") : ST("NOT SUPPORTED", false));
-  test("Geolocation", () => navigator.geolocation ? ST("PERMISSION REQUIRED", "warn") : ST("NOT SUPPORTED", false));
-  test("Camera", () => navigator.mediaDevices?.getUserMedia ? ST("PERMISSION REQUIRED", "warn") : ST("NOT SUPPORTED", false));
-  test("Microphone", () => navigator.mediaDevices?.getUserMedia ? ST("PERMISSION REQUIRED", "warn") : ST("NOT SUPPORTED", false));
-  test("Bluetooth", () => navigator.bluetooth ? ST("PERMISSION REQUIRED", "warn") : ST("NOT SUPPORTED", false));
-  test("USB", () => navigator.usb ? ST("PERMISSION REQUIRED", "warn") : ST("NOT SUPPORTED", false));
-  test("Gamepad", () => navigator.getGamepads ? ST("PASS", true) : ST("NOT SUPPORTED", false));
-  test("Web Audio", () => window.AudioContext || window.webkitAudioContext ? ST("PASS", true) : ST("NOT SUPPORTED", false));
-  test("Screen Capture", () => navigator.mediaDevices?.getDisplayMedia ? ST("PERMISSION REQUIRED", "warn") : ST("NOT SUPPORTED", false));
+  const p = res.status === "passed" ? res.value : null;
+  const rows = [];
+  if (p) {
+    rows.push(["TTFB", p.ttfb != null ? fmtMs(p.ttfb) : "NOT SUPPORTED BY THIS BROWSER"]);
+    rows.push(["First Paint", p.fp != null ? (p.fp / 1000).toFixed(2) + "s" : "NOT SUPPORTED BY THIS BROWSER"]);
+    rows.push(["First Contentful Paint", p.fcp != null ? (p.fcp / 1000).toFixed(2) + "s" : "NOT SUPPORTED BY THIS BROWSER"]);
+    rows.push(["Largest Contentful Paint", state.lcp != null ? (state.lcp / 1000).toFixed(2) + "s" : "NOT SUPPORTED BY THIS BROWSER"]);
+    rows.push(["DOM Content Loaded", (p.dcl / 1000).toFixed(2) + "s"]);
+    rows.push(["Load Event", p.load != null ? (p.load / 1000).toFixed(2) + "s" : "still loading…"]);
+    rows.push(["Total Blocking Time", state.tbt > 0 ? Math.round(state.tbt) + " ms" : NA]);
+    rows.push(["Interaction Latency (INP)", state.inp != null ? state.inp + " ms" : "interact to measure"]);
+    rows.push(["Document Transfer Size", p.transferSize != null ? fmtBytes(p.transferSize) : "NOT SUPPORTED BY THIS BROWSER"]);
+    const resEntries = performance.getEntriesByType("resource") || [];
+    rows.push(["Resources Loaded", String(resEntries.length)]);
+    rows.push(["Total Transfer", fmtBytes(resEntries.reduce((a, r) => a + (r.transferSize || 0), 0) + (p.transferSize || 0))]);
+  } else {
+    rows.push(["Navigation Timing", RS("NOT SUPPORTED BY THIS BROWSER", "unsupported")]);
+  }
+  renderRowsInto("#body-performance", rows);
 
-  state.results.capabilities = Object.fromEntries(results.map(([k, v]) => [k, typeof v === "string" ? v : v.text]));
-  $("#capGrid").innerHTML = results.map(([name, v]) => {
-    const text = typeof v === "string" ? v : v.text;
-    const cls = typeof v === "string" ? "st-gray" : statusClass(v.st);
-    return `<div class="cap-item"><span>${esc(name)}</span><span class="cap-status ${cls}">${esc(text)}</span></div>`;
-  }).join("");
-  const passCount = results.filter(([, v]) => typeof v !== "string" && v.st === true).length;
-  $("#capsBadge").textContent = `${passCount}/${results.length} PASS`;
-  updateHealthRow("BROWSER", ST("READY", true));
+  if (p) {
+    const bar = $("#perfBar");
+    const loadSec = (p.load ?? p.dcl) / 1000;
+    bar.style.width = Math.min(100, Math.max(5, 100 - loadSec * 10)) + "%";
+    let v, st;
+    if (loadSec < 1.5 && (p.fcp == null || p.fcp < 1800)) { v = "EXCELLENT"; st = "passed"; }
+    else if (loadSec < 3) { v = "GOOD"; st = "passed"; }
+    else if (loadSec < 6) { v = "FAIR"; st = "warning"; }
+    else { v = "POOR"; st = "failed"; }
+    $("#perfVerdict").innerHTML = `PERFORMANCE&nbsp;&nbsp;<span class="status ${st}">● ${v}</span>`;
+    updateHealth("PERFORMANCE", v, st);
+    drawBarChartH("perfChart", [
+      p.ttfb != null && p.ttfb >= 0 ? { label: "TTFB", value: p.ttfb } : null,
+      p.fcp != null ? { label: "FCP", value: p.fcp } : null,
+      state.lcp != null ? { label: "LCP", value: state.lcp } : null,
+      { label: "DOM Ready", value: p.dcl },
+      p.load != null ? { label: "Load", value: p.load } : null
+    ].filter(Boolean));
+    renderResourceBreakdown();
+  } else {
+    $("#perfVerdict").innerHTML = `PERFORMANCE&nbsp;&nbsp;<span class="status st-gray">● UNKNOWN</span>`;
+    chartOverlay($("#perfChartBox"), "empty", "NO DATA AVAILABLE", "This browser does not expose Navigation Timing.");
+  }
+  return res;
 }
 
-/* ---------------- storage ---------------- */
-async function runStorageTests() {
-  const out = [];
-  const syncCheck = (name, fn) => { try { out.push([name, fn()]); } catch { out.push([name, ST("BLOCKED", false)]); } };
-
-  syncCheck("Cookies", () => {
-    document.cookie = "_jwl_s=1; SameSite=Lax; path=/";
-    const ok = document.cookie.includes("_jwl_s");
-    document.cookie = "_jwl_s=; Max-Age=0; path=/";
-    return ok ? ST("WRITABLE", true) : ST("BLOCKED", false);
-  });
-  syncCheck("LocalStorage", () => {
-    const k = "_jwl_ls_" + Date.now();
-    localStorage.setItem(k, "ok");
-    const ok = localStorage.getItem(k) === "ok";
-    localStorage.removeItem(k);
-    return ok ? ST("WRITABLE", true) : ST("FAILED", false);
-  });
-  syncCheck("SessionStorage", () => {
-    const k = "_jwl_ss_" + Date.now();
-    sessionStorage.setItem(k, "ok");
-    const ok = sessionStorage.getItem(k) === "ok";
-    sessionStorage.removeItem(k);
-    return ok ? ST("WRITABLE", true) : ST("FAILED", false);
-  });
-
-  const asyncCheck = async (name, fn) => {
-    try { out.push([name, await fn()]); }
-    catch { out.push([name, ST("BLOCKED / NOT AVAILABLE", "gray")]); }
-  };
-
-  await asyncCheck("IndexedDB", () => new Promise(resolve => {
-    if (!window.indexedDB) return resolve(ST("NOT SUPPORTED", false));
-    let db;
-    const req = indexedDB.open("_jwl_test", 1);
-    req.onerror = () => resolve(ST("BLOCKED", false));
-    req.onsuccess = () => { db.close(); indexedDB.deleteDatabase("_jwl_test"); resolve(ST("WRITABLE", true)); };
-  }));
-  await asyncCheck("Cache Storage", async () => {
-    if (!window.caches) return ST("NOT SUPPORTED", false);
-    const c = await caches.open("_jwl_test");
-    await c.put("/_jwl_probe", new Response("ok"));
-    const r = await c.match("/_jwl_probe");
-    await caches.delete("_jwl_test");
-    return r ? ST("WRITABLE", true) : ST("FAILED", false);
-  });
-  await asyncCheck("Service Worker", async () => {
-    if (!("serviceWorker" in navigator)) return ST("NOT SUPPORTED", false);
-    const reg = await navigator.serviceWorker.getRegistration();
-    return reg ? ST("REGISTERED", true) : ST("AVAILABLE — NONE REGISTERED", "gray");
-  });
-
-  state.results.storage = Object.fromEntries(out.map(([k, v]) => [k, typeof v === "string" ? v : v.text]));
-  renderRows("#storageData", out);
+function renderResourceBreakdown() {
+  const wrap = $("#resourceBreakdown");
+  let entries;
+  try { entries = performance.getEntriesByType("resource") || []; } catch { entries = []; }
+  const cats = { JS: 0, CSS: 0, Images: 0, Fonts: 0, Other: 0 };
+  let counted = 0;
+  for (const r of entries) {
+    const size = r.transferSize || r.encodedBodySize || 0;
+    if (!size) continue;
+    counted += size;
+    const url = (r.name || "").split("?")[0];
+    if (r.initiatorType === "script" || /\.js$/.test(url)) cats.JS += size;
+    else if (r.initiatorType === "css" || r.initiatorType === "link" || /\.css$/.test(url)) cats.CSS += size;
+    else if (r.initiatorType === "img" || /\.(png|jpe?g|gif|webp|avif|svg)$/.test(url)) cats.Images += size;
+    else if (/\.(woff2?|ttf|otf|eot)$/.test(url)) cats.Fonts += size;
+    else cats.Other += size;
+  }
+  if (!counted) {
+    wrap.innerHTML = `<div class="chart-state chart-empty">RESOURCE DATA UNAVAILABLE<br><span>Resource Timing returned no sized entries.</span></div>`;
+    return;
+  }
+  wrap.innerHTML = `<div class="resource-list">` + Object.entries(cats).map(([label, size]) => `
+    <div class="res-row">
+      <span class="res-label">${label}</span>
+      <div class="res-track"><div class="res-fill" style="width:${Math.max(counted ? (size / counted) * 100 : 0, size ? 1 : 0)}%"></div></div>
+      <span class="res-val">${fmtBytes(size)} · ${counted ? Math.round((size / counted) * 100) : 0}%</span>
+    </div>`).join("") + `
+    <div class="res-row"><span class="res-label">TOTAL</span><span class="res-val" style="min-width:auto">${fmtBytes(counted)} across ${entries.length} resources</span></div>
+  </div>`;
 }
 
-/* ---------------- js engine + benchmark ---------------- */
-function runJsEnginePanel() {
-  renderRows("#jsData", [
-    ["JavaScript", ST("ENABLED", true)],
-    ["WebAssembly", typeof WebAssembly === "object" ? ST("PASS", true) : ST("NOT SUPPORTED", false)],
-    ["Worker Support", typeof Worker !== "undefined" ? ST("PASS", true) : ST("NOT SUPPORTED", false)],
-    ["ES Modules", "noModule" in document.createElement("script") ? ST("PASS", true) : ST("CHECK FAILED", "gray")],
-    ["BigInt", typeof BigInt === "function" ? ST("PASS", true) : ST("NOT SUPPORTED", false)],
-    ["Async/Await", (() => { try { return (async () => {})() instanceof Promise ? ST("PASS", true) : ST("NOT SUPPORTED", false); } catch { return ST("NOT SUPPORTED", false); } })()],
-    ["Optional Chaining", (() => { try { return ({}) ?.a === undefined ? ST("PASS", true) : ST("FAIL", false); } catch { return ST("NOT SUPPORTED", false); } })()],
-    ["Web Crypto", crypto?.subtle ? ST("PASS", true) : ST("NOT SUPPORTED", false)],
-    ["Performance API", performance.mark ? ST("PASS", true) : ST("NOT SUPPORTED", false)]
+/* ================================================================
+   MODULE: DATABASE
+   ================================================================ */
+async function runDatabaseTests() {
+  const res = await runTest("db-check", "Database connectivity", "database", async () => {
+    if (!navigator.onLine) { const e = new Error("NETWORK OFFLINE"); e.code = "OFFLINE"; throw e; }
+    return api("/api/diagnostics/database", { timeout: 5500 });
+  }, { timeout: 6500, weight: 8 });
+
+  if (res.status !== "passed") {
+    renderRowsInto("#body-database", [["Connection", RS(res.error === "NETWORK" ? "REQUIRES SERVER ENDPOINT" : "TEST FAILED", "failed")], ["Detail", res.error || NA]]);
+    updateHealth("DATABASE", "UNAVAILABLE", "warning");
+    $("#lsDatabase").textContent = "● UNAVAILABLE"; $("#lsDatabase").className = "v status st-gray";
+    return res;
+  }
+  const d = res.value;
+  renderRowsInto("#body-database", [
+    ["Connection", d.connected ? RS("CONNECTED", "passed") : RS("UNAVAILABLE", "warning")],
+    ["Database", d.database || NA],
+    ["Version", d.version || NA],
+    ["Probe Latency", d.latencyMs != null ? fmtMs(d.latencyMs) : NA],
+    ["Detail", d.detail || NA]
   ]);
+  updateHealth("DATABASE", d.connected ? "CONNECTED" : "UNAVAILABLE", d.connected ? "passed" : "warning");
+  const ls = $("#lsDatabase");
+  if (d.connected) { ls.textContent = "● ONLINE"; ls.className = "v status st-green"; }
+  else { ls.textContent = "● UNAVAILABLE"; ls.className = "v status st-yellow"; }
+  return res;
 }
 
-function runBenchmark() {
-  renderRows("#benchData", [["Benchmark", "Running…"]]);
-  setTimeout(() => {
-    const N = 2_000_000;
-    let t0 = performance.now();
-    let x = 0;
-    for (let i = 0; i < N; i++) x += Math.sqrt(i % 1000);
+/* ================================================================
+   MODULE: JS ENGINE (+ benchmark)
+   ================================================================ */
+async function runJsEngineTests() {
+  const feats = await runTest("js-feats", "JavaScript engine features", "jsengine", () => ({
+    wasm: typeof WebAssembly === "object",
+    worker: typeof Worker !== "undefined",
+    esm: "noModule" in document.createElement("script"),
+    bigint: typeof BigInt === "function",
+    optionalChaining: (() => { try { return ({}) ?.a === undefined; } catch { return false; } })(),
+    crypto: !!(crypto && crypto.subtle),
+    perf: typeof performance?.mark === "function",
+    asyncAwait: (() => { try { return (async () => {})() instanceof Promise; } catch { return false; } })()
+  }), { timeout: 2000, weight: 5 });
+
+  const f = feats.status === "passed" ? feats.value : {};
+
+  const bench = await runTest("js-bench", "JS micro-benchmark", "jsengine", () => {
+    const N = 1_000_000;
+    let t0 = performance.now(), x = 0;
+    for (let i = 0; i < N; i++) x += Math.sqrt(i % 997);
     const loopMs = performance.now() - t0;
+    if (x === -1) console.log(x);
 
     t0 = performance.now();
-    const arr = Array.from({ length: 200_000 }, (_, i) => i);
+    const arr = Array.from({ length: 100_000 }, (_, i) => i);
     arr.sort((a, b) => b - a);
     const sortMs = performance.now() - t0;
 
     t0 = performance.now();
-    let s = "";
-    for (let i = 0; i < 50_000; i++) s += "x";
-    const strMs = performance.now() - t0;
-
-    t0 = performance.now();
-    const json = JSON.stringify({ arr: arr.slice(0, 1000) });
+    const json = JSON.stringify({ sample: arr.slice(0, 500) });
     JSON.parse(json);
     const jsonMs = performance.now() - t0;
 
-    const total = loopMs + sortMs + strMs + jsonMs;
-    state.results.benchmark = { loopMs, sortMs, strMs, jsonMs, total, opsPerSec: Math.round(N / (loopMs / 1000)) };
-    renderRows("#benchData", [
-      ["Numeric Loop (2M)", loopMs.toFixed(1) + " ms"],
-      ["Array Sort (200K)", sortMs.toFixed(1) + " ms"],
-      ["String Concat (50K)", strMs.toFixed(1) + " ms"],
-      ["JSON Serialize", jsonMs.toFixed(1) + " ms"],
-      ["Total Time", total.toFixed(1) + " ms"],
-      ["Throughput", Math.round(N / (loopMs / 1000)).toLocaleString() + " ops/s"]
-    ]);
-    toast("Benchmark complete: " + total.toFixed(0) + " ms total", "ok");
-  }, 30);
-}
+    return { loopMs, sortMs, jsonMs, total: loopMs + sortMs + jsonMs, opsPerSec: Math.round(N / (loopMs / 1000)) };
+  }, { timeout: 8000, weight: 5 });
 
-/* ---------------- database ---------------- */
-async function loadDatabasePanel() {
-  const d = await fetchJSON("/api/diagnostics/database");
-  if (!d) {
-    renderRows("#dbData", [["Connection", ST("UNKNOWN — API OFFLINE", "gray")], ["Database", NA], ["Version", NA], ["Response", NA]]);
-    $("#dbBadge").textContent = "API OFFLINE";
-    return;
-  }
-  state.results.database = d;
-  renderRows("#dbData", [
-    ["Connection", ST(d.connected ? "CONNECTED" : "NOT CONNECTED", d.connected ? true : "warn")],
-    ["Database", d.database || NA],
-    ["Version", d.version || NA],
-    ["Response Time", d.responseMs != null ? d.responseMs + " ms" : NA],
-    ["Detail", d.detail || NA]
+  renderRowsInto("#body-jsengine", [
+    ["JavaScript", RS("ENABLED", "passed")],
+    ["WebAssembly", f.wasm ? RS("PASS", "passed") : RS("NOT SUPPORTED", "unsupported")],
+    ["Worker Support", f.worker ? RS("PASS", "passed") : RS("NOT SUPPORTED", "unsupported")],
+    ["ES Modules", f.esm ? RS("PASS", "passed") : RS("UNKNOWN", "warning")],
+    ["BigInt", f.bigint ? RS("PASS", "passed") : RS("NOT SUPPORTED", "unsupported")],
+    ["Async/Await", f.asyncAwait ? RS("PASS", "passed") : RS("NOT SUPPORTED", "unsupported")],
+    ["Optional Chaining", f.optionalChaining ? RS("PASS", "passed") : RS("NOT SUPPORTED", "unsupported")],
+    ["Web Crypto", f.crypto ? RS("PASS", "passed") : RS("NOT SUPPORTED", "unsupported")],
+    ["Performance API", f.perf ? RS("PASS", "passed") : RS("NOT SUPPORTED", "unsupported")]
   ]);
-  $("#dbBadge").textContent = d.connected ? "CONNECTED" : "NO DATABASE";
+
+  if (bench.status === "passed") {
+    const b = bench.value;
+    renderRowsInto("#benchData", [
+      ["Numeric Loop (1M)", fmtMs(b.loopMs)],
+      ["Array Sort (100K)", fmtMs(b.sortMs)],
+      ["JSON Serialize", fmtMs(b.jsonMs)],
+      ["Total Time", fmtMs(b.total)],
+      ["Throughput", b.opsPerSec.toLocaleString() + " ops/s"],
+      ["Benchmark Status", RS("COMPLETED", "passed")]
+    ]);
+  } else {
+    renderRowsInto("#benchData", [["Benchmark", RS("FAILED · " + (bench.error || ""), "failed")]]);
+  }
+  return feats;
 }
 
-/* ---------------- health / score ---------------- */
-const healthState = {};
-function updateHealthRow(label, stObj) {
-  healthState[label] = stObj;
-  const rows = $$("#healthRows .row");
-  const map = { SERVER: 0, NETWORK: 1, HTTPS: 2, BROWSER: 3, PERFORMANCE: 4, DATABASE: 5 };
-  const row = rows[map[label]];
-  if (!row) return;
-  const v = row.querySelector(".v");
-  v.className = "v status " + statusClass(stObj.st);
-  v.innerHTML = `${dotHtml(stObj.st)} ${esc(stObj.text)}`;
+/* ================================================================
+   MODULE: CLOCK
+   ================================================================ */
+async function runClockTests() {
+  const res = await runTest("clock-offset", "Server/client clock comparison", "clock", async () => {
+    const r = await fetch(location.href, { method: "HEAD", cache: "no-store" });
+    const dateHeader = r.headers.get("date");
+    if (!dateHeader) throw unsupportedErr("Server does not send Date header");
+    const serverMs = new Date(dateHeader).getTime();
+    const nav = performance.getEntriesByType("navigation")[0];
+    const localAtResponse = nav?.responseStart ?? Date.now();
+    return serverMs - localAtResponse;
+  }, { timeout: 6000, weight: 4 });
+
+  if (res.status !== "passed") {
+    $("#serverClock").textContent = "NOT AVAILABLE";
+    $("#clockOffset").textContent = "—";
+    return res;
+  }
+  state.serverOffsetMs = res.value;
+  tickClock();
+  return res;
+}
+setInterval(() => { if ($("#clientClock")) tickClock(); }, 1000);
+function tickClock() {
+  const now = new Date();
+  $("#clientClock").textContent = now.toTimeString().slice(0, 8);
+  if (state.serverOffsetMs != null) {
+    $("#serverClock").textContent = new Date(Date.now() + state.serverOffsetMs).toTimeString().slice(0, 8);
+    const s = Math.round(state.serverOffsetMs / 1000);
+    $("#clockOffset").textContent = (s === 0 ? "±0" : (s > 0 ? "+" : "") + s) + "s";
+  }
+}
+function applyClockOffset(dateHeader) {
+  if (!dateHeader) return;
+  const serverMs = new Date(dateHeader).getTime();
+  const nav = performance.getEntriesByType("navigation")[0];
+  state.serverOffsetMs = serverMs - (nav?.responseStart ?? Date.now());
+  tickClock();
+}
+
+/* ================================================================
+   HEALTH + SCORE
+   ================================================================ */
+function updateHealth(label, text, st) {
+  const el = $(`#healthRows [data-hl="${label}"]`);
+  if (!el) return;
+  const dot = { passed: "dot-green", warning: "dot-yellow", failed: "dot-red", unsupported: "dot-gray" }[st] || "dot-gray";
+  const cls = { passed: "st-green", warning: "st-yellow", failed: "st-red", unsupported: "st-gray" }[st] || "st-gray";
+  el.innerHTML = `<span class="status-dot ${dot}"></span> ${esc(text)}`;
+  el.className = "v status " + cls;
 }
 
 function computeScore() {
-  let score = 0;
-  const parts = [];
-  const add = (label, cond, weight) => {
-    const got = cond === true ? weight : cond === "warn" ? Math.round(weight * 0.5) : 0;
-    parts.push([label, cond, weight, got]);
-    score += got;
-  };
-
-  add("SERVER", healthState.SERVER?.st === true ? true : healthState.SERVER ? "warn" : "gray", 15);
-  add("NETWORK", healthState.NETWORK?.st === true ? true : healthState.NETWORK?.st === "warn" ? "warn" : "gray", 15);
-  add("HTTPS", healthState.HTTPS?.st === true ? true : healthState.HTTPS?.st === false ? false : "gray", 20);
-  add("BROWSER", healthState.BROWSER?.st === true, 10);
-  const perfSt = healthState.PERFORMANCE?.st;
-  add("PERFORMANCE", perfSt === true ? true : perfSt === "warn" ? "warn" : perfSt === false ? false : "gray", 15);
-  const caps = state.results.capabilities || {};
-  const capPass = Object.values(caps).filter(v => v === "PASS").length;
-  const capTotal = Math.max(1, Object.keys(caps).length);
-  const capRatio = capPass / capTotal;
-  add("CAPABILITIES", capRatio > 0.7 ? true : capRatio > 0.4 ? "warn" : false, 10);
-  const storage = state.results.storage || {};
-  const storPass = Object.values(storage).filter(v => v === "WRITABLE" || v === "REGISTERED").length;
-  add("STORAGE", storPass >= 4 ? true : storPass >= 2 ? "warn" : false, 10);
-  const dbSt = state.results.database;
-  add("DATABASE", dbSt ? (dbSt.connected ? true : "warn") : "gray", 5);
-
-  state.score = { score, parts };
-  return { score, parts };
-}
-
-/* ---------------- full diagnostic ---------------- */
-async function runFullDiagnostic(full = true) {
-  const btn = $("#btnFullDiag"), quick = $("#btnQuickTest");
-  btn.disabled = true; quick.disabled = true;
-  $("#diagProgress").classList.remove("hidden");
-  $("#systemStatus").textContent = "RUNNING…";
-
-  const steps = full ? [
-    ["Detecting client environment…", () => runClientDetection()],
-    ["Testing network…", () => runNetworkPanel()],
-    ["Querying server info…", () => loadServerInfo()],
-    ["Analyzing HTTP response…", () => runHttpDiagnostics()],
-    ["Checking TLS/SSL…", () => {}],
-    ["Resolving DNS…", () => runDnsTest()],
-    ["Probing browser capabilities…", () => runCapabilityTests()],
-    ["Testing storage…", () => runStorageTests()],
-    ["Measuring performance…", () => runPerformancePanel()],
-    ["Testing database…", () => loadDatabasePanel()],
-    ["Generating report…", () => { runJsEnginePanel(); }]
-  ] : [
-    ["Detecting client environment…", () => runClientDetection()],
-    ["Testing network & latency…", () => runLatencyTest()],
-    ["Analyzing HTTP response…", () => runHttpDiagnostics()],
-    ["Measuring performance…", () => runPerformancePanel()]
-  ];
-
-  for (let i = 0; i < steps.length; i++) {
-    const [label, fn] = steps[i];
-    setProgress(i / steps.length, label);
-    try { await fn(); } catch (e) { console.warn(e); }
-    await new Promise(r => setTimeout(r, 120));
+  let got = 0, total = 0, passed = 0, warnings = 0, failed = 0, unsupported = 0;
+  for (const r of Engine.results.values()) {
+    if (r.status === "unsupported") { unsupported++; continue; }
+    if (["idle", "cancelled"].includes(r.status)) continue;
+    total += r.weight;
+    if (r.status === "passed") { got += r.weight; passed++; }
+    else if (r.status === "warning") { got += r.weight * 0.5; warnings++; }
+    else { failed++; }
   }
-  setProgress(1, "Diagnostic complete.");
-
-  const { score, parts } = computeScore();
-  $("#healthScoreBadge").textContent = `${score} / 100`;
-  $("#systemStatus").textContent = "DIAGNOSTIC COMPLETE";
-  toast(`Diagnostic complete — overall health ${score}/100`, score >= 70 ? "ok" : "warn");
-  btn.disabled = false; quick.disabled = false;
-  setTimeout(() => $("#diagProgress").classList.add("hidden"), 1500);
+  return { score: total ? Math.round((got / total) * 100) : null, passed, warnings, failed, unsupported, weightedTotal: total };
 }
+
+/* ================================================================
+   FULL DIAGNOSTIC RUNNER
+   ================================================================ */
+function newRunId() {
+  const b = new Uint8Array(3);
+  crypto.getRandomValues(b);
+  return Array.from(b, x => x.toString(16).padStart(2, "0")).join("").toUpperCase();
+}
+
 function setProgress(frac, label) {
   const pct = Math.round(frac * 100);
   const filled = Math.round(frac * 20);
@@ -835,79 +1410,227 @@ function setProgress(frac, label) {
   $("#progressLabel").textContent = label;
 }
 
-$("#btnFullDiag").addEventListener("click", () => runFullDiagnostic(true));
-$("#btnQuickTest").addEventListener("click", () => runFullDiagnostic(false));
+async function runModule(key) {
+  const runners = {
+    client: runClientTests, server: runServerTests, network: runNetworkTests,
+    http: runHttpTests, tls: runTlsTests, dns: runDnsTests, browser: runBrowserTests,
+    storage: runStorageTests, performance: runPerformanceTests, database: runDatabaseTests,
+    jsengine: runJsEngineTests, clock: runClockTests
+  };
+  const fn = runners[key];
+  if (!fn) return "idle";
+  setStateBadge(key, "running");
+  try {
+    await fn();
+  } catch (e) {
+    /* runner-level isolation: module crashed but engine continues */
+    console.warn("[module:" + key + "]", e);
+    setStateBadge(key, "failed");
+    renderErrorInto("#body-" + key, "TEST FAILED", e?.message || "Unexpected module error.", key);
+    Engine.results.set("mod-" + key, { id: "mod-" + key, name: MODULES[key].title, category: key, status: "failed", duration: 0, value: null, unit: null, details: null, error: e?.message || "crashed", weight: 5 });
+    return "failed";
+  }
+  const st = summarizeStatus(moduleResults(key));
+  if (st !== "idle") setStateBadge(key, st);
+  /* refresh health rollups */
+  if (key === "server") updateHealth("SERVER", state.serverData ? "ONLINE" : "UNAVAILABLE", state.serverData ? "passed" : "failed");
+  if (key === "browser") { /* handled inside */ }
+  return st;
+}
 
-/* ---------------- export report ---------------- */
+async function runDiagnostic(order) {
+  if (Engine.running) return;
+  Engine.running = true;
+  Engine.cancelled = false;
+  Engine.runId = newRunId();
+  Engine.runStartedAt = Date.now();
+  Engine.results.clear();
+  state.currentRun = { id: Engine.runId, order };
+
+  $("#btnFullDiag").disabled = true;
+  $("#btnQuickTest").disabled = true;
+  $("#btnCancelDiag").classList.remove("hidden");
+  $("#diagProgress").classList.remove("hidden");
+  $("#systemStatus").textContent = "RUNNING…";
+  order.forEach(k => setStateBadge(k, "idle"));
+
+  let completed = 0;
+  const labelOf = k => MODULES[k]?.title || k;
+
+  for (const key of order) {
+    if (Engine.cancelled) break;
+    setProgress(completed / order.length, "Current: " + labelOf(key));
+    $("#progressCount").textContent = `${completed} / ${order.length} tests completed`;
+    if (!navigator.onLine && SERVER_ONLY.has(key)) {
+      setStateBadge(key, "unavailable");
+      Engine.results.set("skip-" + key, { id: "skip-" + key, name: labelOf(key), category: key, status: "cancelled", duration: 0, value: null, unit: null, details: "offline", error: "SKIPPED (OFFLINE)", weight: 0 });
+    } else {
+      await runModule(key);
+    }
+    completed++;
+    setProgress(completed / order.length, "Completed: " + labelOf(key));
+    $("#progressCount").textContent = `${completed} / ${order.length} tests completed`;
+  }
+
+  Engine.runDurationMs = Math.round(performance.now() - Engine.runStartedAt) ;
+  const { score, passed, warnings, failed, unsupported } = computeScore();
+  Engine.running = false;
+
+  $("#btnFullDiag").disabled = false;
+  $("#btnQuickTest").disabled = false;
+  $("#btnCancelDiag").classList.add("hidden");
+
+  const meta = $("#runMeta");
+  if (Engine.cancelled) {
+    setProgress(completed / order.length, "Diagnostic cancelled.");
+    $("#systemStatus").textContent = "CANCELLED";
+    meta.textContent = `RUN #${Engine.runId} — cancelled. Completed: ${completed} / ${order.length}`;
+    toast(`Diagnostic cancelled. Completed: ${completed} / ${order.length}`, "warn");
+  } else {
+    setProgress(1, "DIAGNOSTIC COMPLETE");
+    $("#systemStatus").textContent = "DIAGNOSTIC COMPLETE";
+    $("#healthScoreBadge").textContent = (score ?? "—") + " / 100";
+    const done = new Date();
+    meta.innerHTML =
+      `RUN #${esc(Engine.runId)} — completed ${esc(done.toTimeString().slice(0, 8))} · duration ${(Engine.runDurationMs / 1000).toFixed(2)}s<br>` +
+      `Passed: <b class="st-green">${passed}</b> · Warnings: <b class="st-yellow">${warnings}</b> · Failed: <b class="st-red">${failed}</b> · Unsupported (excluded): <b>${unsupported}</b> · Score: <b class="${score >= 70 ? "st-green" : score >= 40 ? "st-yellow" : "st-red"}">${score ?? "—"}/100</b>`;
+    toast(`Diagnostic complete — health ${score ?? "?"}/100`, score >= 70 ? "ok" : "warn");
+    setTimeout(() => $("#diagProgress").classList.add("hidden"), 2500);
+  }
+}
+
+$("#btnFullDiag").addEventListener("click", () => runDiagnostic(FULL_ORDER));
+$("#btnQuickTest").addEventListener("click", () => runDiagnostic(QUICK_ORDER));
+$("#btnCancelDiag").addEventListener("click", () => {
+  Engine.cancelled = true;
+  Engine.controllers.forEach(c => { try { c.abort(new DOMException("CANCELLED", "AbortError")); } catch {} });
+});
+
+/* per-panel RUN/RETRY buttons */
+document.addEventListener("click", e => {
+  const btn = e.target.closest("[data-module-run]");
+  if (!btn) return;
+  const key = btn.dataset.moduleRun;
+  if (!MODULES[key] || Engine.running) return;
+  btn.disabled = true;
+  runModule(key).finally(() => { btn.disabled = false; });
+});
+$("#btnLatency").addEventListener("click", async e => {
+  e.target.disabled = true;
+  await runLatencyTest();
+  e.target.disabled = false;
+});
+
+/* ================================================================
+   REPORT EXPORT
+   ================================================================ */
+function buildReportJSON() {
+  const { score, passed, warnings, failed, unsupported } = computeScore();
+  return {
+    tool: "JUAN WEB LAB",
+    version: "2.0.0",
+    runId: Engine.runId,
+    timestamp: new Date().toISOString(),
+    durationMs: Engine.runDurationMs,
+    url: location.href,
+    userAgent: navigator.userAgent,
+    sections: {
+      client: moduleSummary("client"),
+      server: moduleSummary("server"),
+      network: moduleSummary("network"),
+      http: moduleSummary("http"),
+      tls: moduleSummary("tls"),
+      dns: moduleSummary("dns"),
+      browser: moduleSummary("browser"),
+      storage: moduleSummary("storage"),
+      performance: moduleSummary("performance"),
+      database: moduleSummary("database")
+    },
+    tests: [...Engine.results.values()].map(r => ({
+      id: r.id, name: r.name, category: r.category, status: r.status,
+      durationMs: r.duration, error: r.error, details: r.details
+    })),
+    score: { overall: score, passed, warnings, failed, unsupportedExcluded: unsupported, formula: "weighted: PASS=100%, WARNING=50%, FAILED=0%, UNSUPPORTED excluded" }
+  };
+}
+function moduleSummary(cat) {
+  return moduleResults(cat).filter(r => !r.id.startsWith("mod-")).map(r => ({ id: r.id, status: r.status, durationMs: r.duration }));
+}
 function buildReportText() {
-  const lines = [];
-  lines.push("JUAN WEB LAB — DIAGNOSTIC REPORT");
-  lines.push("Generated: " + new Date().toISOString());
-  lines.push("Target: " + location.href);
-  lines.push("=".repeat(60));
-  for (const [key, val] of Object.entries(state.results)) {
-    lines.push("");
-    lines.push("-- " + key.toUpperCase() + " --");
-    lines.push(JSON.stringify(val, null, 2));
+  const rep = buildReportJSON();
+  const L = [];
+  L.push("JUAN WEB LAB — DIAGNOSTIC REPORT");
+  L.push("Run #" + (rep.runId || "—") + "  ·  " + rep.timestamp);
+  L.push("Target: " + rep.url);
+  L.push("=".repeat(60));
+  for (const [sec, items] of Object.entries(rep.sections)) {
+    L.push("");
+    L.push("-- " + sec.toUpperCase() + " --");
+    if (!items.length) L.push("  (not run)");
+    items.forEach(i => L.push(`  ${i.id.padEnd(22)} ${i.status.padEnd(12)} ${i.durationMs}ms`));
   }
-  if (state.score) {
-    lines.push("");
-    lines.push("-- OVERALL HEALTH --");
-    lines.push("Score: " + state.score.score + "/100");
-    state.score.parts.forEach(([l, c, w, g]) => lines.push(`  ${l}: ${g}/${w}`));
-  }
-  lines.push("");
-  lines.push("Values marked NOT AVAILABLE could not be detected.");
-  return lines.join("\n");
+  L.push("");
+  L.push("-- SCORE --");
+  L.push(`Overall: ${rep.score.overall ?? "—"}/100  (passed ${rep.score.passed}, warnings ${rep.score.warnings}, failed ${rep.score.failed}, excluded ${rep.score.unsupportedExcluded})`);
+  L.push("");
+  L.push("Values marked NOT AVAILABLE were genuinely undetectable.");
+  return L.join("\n");
 }
 $("#btnExport").addEventListener("click", () => {
-  if (Object.keys(state.results).length < 3) { toast("Run at least Quick Test first.", "warn"); return; }
+  if (!Engine.results.size) { toast("No results yet — run a diagnostic first.", "warn"); return; }
   const wrap = document.createElement("div");
   wrap.className = "toast";
-  wrap.innerHTML = `Export report as:
-    <button class="btn btn-small btn-outline" data-fmt="json">JSON</button>
-    <button class="btn btn-small btn-outline" data-fmt="txt">TXT</button>
-    <button class="btn btn-small btn-outline" data-fmt="pdf">PDF</button>`;
   wrap.style.display = "flex"; wrap.style.gap = "8px"; wrap.style.flexWrap = "wrap"; wrap.style.alignItems = "center";
+  wrap.append("Export:");
+  const mk = (fmt, label) => {
+    const b = document.createElement("button");
+    b.className = "btn btn-small btn-outline";
+    b.textContent = label;
+    b.onclick = () => {
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      if (fmt === "json") download(JSON.stringify(buildReportJSON(), null, 2), `juan-web-lab-${stamp}.json`, "application/json");
+      else if (fmt === "txt") download(buildReportText(), `juan-web-lab-${stamp}.txt`, "text/plain");
+      else window.print();
+      wrap.remove();
+    };
+    return b;
+  };
+  wrap.append(mk("json", "JSON"), mk("txt", "TXT"), mk("pdf", "PDF (print)"));
   $("#toastWrap").appendChild(wrap);
-  wrap.querySelectorAll("[data-fmt]").forEach(b => b.onclick = () => {
-    const fmt = b.dataset.fmt;
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    if (fmt === "json") download(JSON.stringify(state.results, null, 2), `juan-web-lab-report-${stamp}.json`, "application/json");
-    else if (fmt === "txt") download(buildReportText(), `juan-web-lab-report-${stamp}.txt`, "text/plain");
-    else window.print();
-    wrap.remove();
-  });
-  setTimeout(() => wrap.remove(), 8000);
+  setTimeout(() => wrap.remove(), 9000);
 });
 function download(content, filename, type) {
   const blob = new Blob([content], { type });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = filename;
+  document.body.appendChild(a);
   a.click();
-  URL.revokeObjectURL(a.href);
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
   toast("Report exported: " + filename, "ok");
 }
 
-/* ---------------- HTTP status lab ---------------- */
+/* ================================================================
+   HTTP STATUS LAB
+   ================================================================ */
 const STATUS_CODES = {
   200: ["OK", "Standard success response.", "Resource found and returned normally."],
-  201: ["Created", "Request succeeded and a new resource was created.", "POST that creates a resource returns this."],
-  204: ["No Content", "Success with no body returned.", "Successful DELETE or PUT without response body."],
-  301: ["Moved Permanently", "Resource permanently moved to a new URL.", "Domain migration or HTTP → HTTPS redirect."],
-  302: ["Found", "Temporary redirect to another URL.", "Temporary maintenance or A/B routing."],
-  304: ["Not Modified", "Cached version is still valid.", "Client sends If-None-Match / If-Modified-Since and content unchanged."],
-  400: ["Bad Request", "Server cannot process the malformed request.", "Invalid JSON body, bad query parameters."],
-  401: ["Unauthorized", "Authentication required or failed.", "Missing/expired token or wrong credentials."],
-  403: ["Forbidden", "Server understood but refuses to authorize.", "IP blocked, missing permission, directory listing disabled."],
+  201: ["Created", "Request succeeded and a new resource was created.", "POST that creates a resource."],
+  204: ["No Content", "Success with no body returned.", "Successful DELETE or PUT without a body."],
+  301: ["Moved Permanently", "Resource permanently moved to a new URL.", "Domain migration, HTTP → HTTPS redirect."],
+  302: ["Found", "Temporary redirect to another URL.", "Temporary maintenance routing."],
+  304: ["Not Modified", "Cached version still valid.", "Conditional request matched ETag."],
+  400: ["Bad Request", "Server cannot process the malformed request.", "Invalid JSON, bad query parameters."],
+  401: ["Unauthorized", "Authentication required or failed.", "Missing/expired token."],
+  403: ["Forbidden", "Server refuses to authorize.", "IP blocked, permissions, disabled listing."],
   404: ["Not Found", "Requested resource does not exist.", "Broken link, wrong path, deleted file."],
-  408: ["Request Timeout", "Client took too long to send the request.", "Slow mobile connection uploading large body."],
-  429: ["Too Many Requests", "Rate limit exceeded.", "API rate limiting or bot protection triggered."],
-  500: ["Internal Server Error", "Unexpected server-side failure.", "Application crash, unhandled exception, misconfiguration."],
-  502: ["Bad Gateway", "Upstream returned an invalid response.", "Backend/app server down while reverse proxy still up."],
-  503: ["Service Unavailable", "Server temporarily overloaded or under maintenance.", "Restarting service, capacity limits, maintenance mode."],
-  504: ["Gateway Timeout", "Upstream did not respond in time.", "Backend too slow behind nginx/proxy timeout."]
+  408: ["Request Timeout", "Client took too long to send the request.", "Slow connection uploading large body."],
+  429: ["Too Many Requests", "Rate limit exceeded.", "API throttling or bot protection."],
+  500: ["Internal Server Error", "Unexpected server-side failure.", "Unhandled exception, misconfiguration."],
+  502: ["Bad Gateway", "Upstream returned an invalid response.", "App server down behind reverse proxy."],
+  503: ["Service Unavailable", "Temporarily overloaded or in maintenance.", "Restarting service, capacity limit."],
+  504: ["Gateway Timeout", "Upstream did not respond in time.", "Slow backend behind proxy timeout."]
 };
 (function initStatusLab() {
   const grid = $("#codeGrid");
@@ -915,83 +1638,99 @@ const STATUS_CODES = {
     const b = document.createElement("button");
     b.className = "code-chip";
     b.type = "button";
+    b.setAttribute("role", "option");
+    b.setAttribute("aria-label", "HTTP " + code + " " + STATUS_CODES[code][0]);
     b.textContent = code;
-    b.setAttribute("aria-label", "HTTP " + code);
-    b.onclick = () => {
+    b.addEventListener("click", () => {
       $$(".code-chip").forEach(c => c.classList.remove("active"));
       b.classList.add("active");
       const [meaning, desc, cause] = STATUS_CODES[code];
       $("#cdCode").textContent = code;
       $("#cdMeaning").textContent = meaning;
-      renderRows("#cdBody", [["Description", desc], ["Common Cause", cause], ["Example", `curl -I https://httpstat.us/${code}  →  HTTP/${code.startsWith("4") || code.startsWith("5") ? "1.1" : "2"} ${code} ${meaning}`]]);
+      renderRowsInto("#cdBody", [["Description", desc], ["Common Cause", cause], ["Example", `curl -I <your-url>  →  HTTP ${code} ${meaning}`]]);
       $("#codeDetail").classList.remove("hidden");
-    };
+    });
     grid.appendChild(b);
   });
 })();
 
-/* ---------------- API tester ---------------- */
-$("#apiForm").addEventListener("submit", async (e) => {
+/* ================================================================
+   API TESTER
+   ================================================================ */
+$("#apiForm").addEventListener("submit", async e => {
   e.preventDefault();
   const method = $("#apiMethod").value;
   const urlStr = $("#apiUrl").value.trim();
   const resultBox = $("#apiResult");
 
   let target;
-  try { target = new URL(urlStr); } catch { toast("Invalid URL", "err"); return; }
-  if (!/^https?:$/.test(target.protocol)) { toast("Only http/https URLs allowed", "err"); return; }
-  const local = [location.hostname, "localhost", "127.0.0.1", "[::1]", "0.0.0.0"].some(h => target.hostname === h || target.hostname.endsWith("." + h));
-  if (local && target.port && !["80", "443", "8080", location.port].includes(target.port)) {
-    toast("Blocked: requests to local network ports are not allowed", "err");
-    return;
-  }
+  try { target = new URL(urlStr); }
+  catch { renderApiError(resultBox, "INVALID URL", "The URL could not be parsed."); return; }
+  if (!/^https?:$/.test(target.protocol)) { renderApiError(resultBox, "PROTOCOL RESTRICTED", "Only http:// and https:// URLs are allowed."); return; }
+  if (target.username || target.password) { renderApiError(resultBox, "CREDENTIALS IN URL", "Embedding credentials in URLs is blocked."); return; }
 
   let headers = {};
-  const rawHeaders = $("#apiHeaders").value.trim();
-  if (rawHeaders) {
+  const raw = $("#apiHeaders").value.trim();
+  if (raw) {
     try {
-      headers = JSON.parse(rawHeaders);
-      if (typeof headers !== "object" || Array.isArray(headers)) throw 0;
-      for (const k of Object.keys(headers)) if (/^(authorization-internal|cookie)$/i.test(k)) delete headers[k];
-    } catch { toast("Headers must be valid JSON object", "err"); return; }
+      headers = JSON.parse(raw);
+      if (!headers || typeof headers !== "object" || Array.isArray(headers)) throw 0;
+    } catch { renderApiError(resultBox, "INVALID HEADERS", "Headers must be a valid JSON object."); return; }
   }
+
   const opts = { method, headers, signal: AbortSignal.timeout(15000) };
-  const body = $("#apiBody").value.trim();
-  if (body && !["GET", "HEAD"].includes(method)) opts.body = body;
+  const bodyStr = $("#apiBody").value.trim();
+  if (bodyStr && !["GET", "HEAD"].includes(method)) opts.body = bodyStr;
 
   const btn = $(".btn-send");
   btn.disabled = true; btn.textContent = "SENDING…";
+  resultBox.classList.remove("hidden");
+  renderRowsInto("#apiMeta", [["Request", RS("RUNNING…", "warning")]]);
+
   const t0 = performance.now();
   try {
     const resp = await fetch(target.href, opts);
     const ms = performance.now() - t0;
-    const hdrs = [];
-    resp.headers.forEach((v, k) => hdrs.push(k + ": " + v));
+    const hdrLines = [];
+    resp.headers.forEach((v, k) => hdrLines.push(k + ": " + v));
     let bodyText = "";
-    try { bodyText = await resp.text(); } catch {}
-    resultBox.classList.remove("hidden");
-    renderRows("#apiMeta", [
-      ["Status", ST(String(resp.status), resp.ok ? true : resp.status < 500 ? "warn" : false)],
+    try { bodyText = await resp.text(); } catch { bodyText = "(binary body — not displayed)"; }
+    renderRowsInto("#apiMeta", [
+      ["Status", RS(String(resp.status), resp.ok ? "passed" : resp.status < 500 ? "warning" : "failed")],
       ["Response Time", fmtMs(ms)],
-      ["Response Size", fmtBytes(new Blob([bodyText]).size)],
+      ["Body Size", fmtBytes(new Blob([bodyText]).size)],
       ["Content-Type", resp.headers.get("content-type") || NA]
     ]);
-    $("#apiRespHeaders").textContent = hdrs.join("\n") || "(none exposed by CORS)";
+    $("#apiRespHeaders").textContent = hdrLines.join("\n") || "(none exposed by CORS)";
     $("#apiRespBody").textContent = bodyText.slice(0, 20000) || "(empty)";
+    toast(`Request completed: HTTP ${resp.status} in ${Math.round(ms)}ms`, resp.ok ? "ok" : "warn");
   } catch (err) {
-    resultBox.classList.remove("hidden");
-    renderRows("#apiMeta", [["Result", ST("REQUEST FAILED", false)], ["Reason", err.name === "TimeoutError" ? "Timed out after 15s" : err.message]]);
-    $("#apiRespHeaders").textContent = ""; $("#apiRespBody").textContent =
-      "Note: failures are usually CORS policy or network blocking on the target side.\nThe request was sent directly from your browser.";
+    const isTimeout = err?.name === "TimeoutError" || err?.name === "AbortError";
+    renderRowsInto("#apiMeta", [
+      ["Result", RS(isTimeout ? "TIMEOUT" : "REQUEST BLOCKED BY CORS POLICY / NETWORK", "failed")],
+      ["Detail", isTimeout ? "Aborted after 15s." : err?.message || "TypeError: Failed to fetch"]
+    ]);
+    $("#apiRespHeaders").textContent = "";
+    $("#apiRespBody").textContent =
+      "The request was sent directly from YOUR browser.\n" +
+      "'Failed to fetch' almost always means the TARGET did not send CORS headers,\n" +
+      "or the network/firewall blocked it — it does not automatically mean the API is broken.";
   } finally {
     btn.disabled = false; btn.textContent = "SEND REQUEST";
   }
 });
+function renderApiError(box, title, msg) {
+  box.classList.remove("hidden");
+  renderRowsInto("#apiMeta", [["Result", RS(title, "failed")], ["Detail", msg]]);
+}
 
-/* ---------------- terminal ---------------- */
+/* ================================================================
+   TERMINAL — fully interactive
+   ================================================================ */
 const termOut = $("#termOut");
+const termInput = $("#termInput");
 const termHistory = [];
-let histIdx = -1;
+let histIdx = 0;
 
 function tprint(html, cls = "") {
   const div = document.createElement("div");
@@ -1003,138 +1742,217 @@ function tprint(html, cls = "") {
 }
 async function ttype(text, cls = "") {
   const div = tprint("", cls);
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
   for (const ch of text) {
     div.textContent += ch;
     termOut.scrollTop = termOut.scrollHeight;
-    await new Promise(r => setTimeout(r, 6));
+    if (!reduced) await new Promise(r => setTimeout(r, 5));
   }
+  return div;
 }
 
-const commands = {
-  help: () => {
+const COMMANDS = {
+  help() {
     tprint("Available commands:", "t-dim");
-    [["help", "show this help"], ["status", "overall system health"], ["server", "server information summary"],
-     ["network", "network + latency summary"], ["browser", "client/browser summary"], ["ssl", "TLS/SSL status"],
-     ["dns", "run DNS resolution"], ["performance", "page performance metrics"], ["benchmark", "run JS benchmark"],
-     ["clear", "clear terminal"]].forEach(([c, d]) => tprint(`  ${c.padEnd(12)}<span class="t-dim">${d}</span>`));
+    [["help", "Show available commands"], ["status", "Show system status"], ["server", "Show server information"],
+     ["network", "Run network diagnostics"], ["browser", "Show browser information"], ["ssl", "Show TLS information"],
+     ["dns", "Run DNS diagnostics"], ["performance", "Show performance metrics"], ["diagnostic", "Run full diagnostic"],
+     ["clear", "Clear terminal"], ["about", "About JUAN WEB LAB"]]
+      .forEach(([c, d]) => tprint(`  ${esc(c.padEnd(13))}<span class="t-dim">${esc(d)}</span>`));
   },
-  status: () => {
-    const rows = $$("#healthRows .row");
-    rows.forEach(r => {
-      const k = r.querySelector(".k").textContent;
-      tprint(`${k.padEnd(14)} ${r.querySelector(".v").textContent.trim()}`);
+  clear() { termOut.innerHTML = ""; },
+  about() {
+    tprint(`<span class="t-ok">JUAN WEB LAB v2.0</span> — Web Infrastructure Diagnostics`);
+    tprint(`Inspect your server. Test your network. Understand your environment.`, "t-dim");
+    tprint(`Every value shown comes from real APIs or the bundled backend. No fake data.`, "t-dim");
+  },
+  status() {
+    $$("#healthRows .row").forEach(r => {
+      tprint(`${esc(r.querySelector(".k").textContent.padEnd(14))} ${esc(r.querySelector(".v").textContent.trim())}`);
     });
-    if (state.score) tprint(`OVERALL        ${state.score.score}/100`, "t-ok");
+    const { score } = computeScore();
+    if (score != null) tprint(`OVERALL        ${score}/100`, "t-ok");
+    tprint(`BACKEND        ${state.backendOk ? "ONLINE" : "UNAVAILABLE"}`, state.backendOk ? "t-ok" : "t-warn");
   },
-  server: () => {
-    const s = state.results.server;
-    if (!s) return ttype("Server API not reachable on this host.", "t-warn");
-    tprint(`hostname   ${s.hostname ?? NA}`);
-    tprint(`os         ${s.os ?? NA}`);
-    tprint(`kernel     ${s.kernel ?? NA}`);
-    tprint(`arch       ${s.arch ?? NA}`);
-    tprint(`cpu        ${(s.cpuModel ?? NA).slice(0, 60)}`);
-    tprint(`cores      ${s.cpuCores ?? NA}`);
-    tprint(`ram        ${s.memTotal ? fmtBytes(s.memTotal) : NA} (${s.memPct ?? "?"}% used)`);
-    tprint(`disk       ${s.diskTotal ? fmtBytes(s.diskTotal) : NA} (${s.diskPct ?? "?"}% used)`);
-    tprint(`uptime     ${s.uptime != null ? fmtSec(s.uptime) : NA}`);
-    tprint(`load       ${s.loadavg?.join(" / ") ?? NA}`);
+  server() {
+    const d = state.serverData;
+    if (!d) return ttype("SERVER DIAGNOSTICS UNAVAILABLE — deploy node server.js on your VPS.", "t-warn");
+    tprint(`hostname   ${esc(d.hostname ?? NA)}`);
+    tprint(`os         ${esc(d.os ?? NA)} ${esc(d.osVersion ?? "")}`);
+    tprint(`kernel     ${esc(d.kernel ?? NA)}`);
+    tprint(`arch       ${esc(d.architecture ?? NA)}`);
+    tprint(`cpu        ${esc((d.cpuModel ?? NA).slice(0, 56))}`);
+    tprint(`cores      ${esc(String(d.cpuCores ?? NA))}`);
+    tprint(`ram        ${fmtBytes(d.memoryTotal)} (${d.memoryPct ?? "?"}% used)`);
+    tprint(`disk       ${d.diskTotal != null ? fmtBytes(d.diskTotal) : NA}${d.diskPct != null ? " (" + d.diskPct + "% used)" : ""}`);
+    tprint(`uptime     ${fmtSec(d.uptime)}`);
+    tprint(`load       ${Array.isArray(d.loadAverage) ? d.loadAverage.join(" / ") : NA}`);
   },
-  network: () => {
-    const n = state.results.network;
-    if (!n) return ttype("Network panel has not run yet. Use RUN FULL DIAGNOSTIC.", "t-warn");
-    tprint(`ip         ${n.clientIp}`);
-    tprint(`online     ${n.online}`);
-    tprint(`conn type  ${n.connectionType}`);
-    tprint(`effective  ${n.effectiveType}`);
-    tprint(`downlink   ${n.downlink}`);
-    if (state.results.latency) tprint(`latency    median ${Math.round(state.results.latency.median)} ms`);
-    ttype("running fresh latency probe…", "t-dim").then(runLatencyTest);
+  async network() {
+    tprint(`online     ${navigator.onLine}`);
+    const conn = navigator.connection;
+    if (conn) tprint(`connection ${esc(conn.effectiveType || conn.type || "unknown")}`);
+    await runLatencyTest();
+    if (state.latencySamples.length) tprint(`latency    median ${Math.round(median(state.latencySamples))} ms over ${state.latencySamples.length} requests`, "t-ok");
   },
-  browser: () => {
-    const c = state.results.client;
-    if (!c) return ttype("Client detection pending.", "t-warn");
-    tprint(`device     ${c.deviceType}`);
-    tprint(`os         ${c.os}`);
-    tprint(`browser    ${c.browser} ${c.browserVersion}`);
-    tprint(`engine     ${c.engine}`);
-    tprint(`screen     ${c.screen} @${c.pixelRatio}x`);
-    tprint(`viewport   ${c.viewport}`);
-    tprint(`cores      ${c.cpuCores}`);
-    tprint(`timezone   ${c.timezone}`);
+  browser() {
+    const rows = $$("#body-browser .cap-item");
+    if (!rows.length) return ttype("Capability tests have not run yet. Use 'diagnostic' or press RUN on Browser Capabilities.", "t-warn");
+    rows.slice(0, 26).forEach(r => tprint(`${esc(r.children[0].textContent.padEnd(20))} ${esc(r.children[1].textContent)}`));
   },
-  ssl: () => {
-    const s = state.results.ssl;
-    if (!s) return ttype("SSL panel has not run yet.", "t-warn");
-    tprint(`https      ${s.https ? "enabled" : "DISABLED"}`, s.https ? "t-ok" : "t-err");
-    tprint(`tls        ${s.tls ?? NA}`);
-    tprint(`hsts       ${s.hsts ? "enabled" : "not set"}`);
+  ssl() {
+    const r = Engine.results.get("tls-check");
+    if (!r) return ttype("SSL panel has not run yet.", "t-warn");
+    tprint(`https      ${location.protocol === "https:" ? "enabled" : "DISABLED"}`, location.protocol === "https:" ? "t-ok" : "t-err");
+    tprint(`hsts       ${state.headers?.["strict-transport-security"] ? "enabled" : "not set"}`);
+    tprint(`mixed      ${hasMixedContent() ? "DETECTED" : "none found"}`);
+    tprint(`cert       limited by browser — inspect via server-side tooling`, "t-dim");
   },
-  dns: async () => {
+  async dns() {
     ttype("resolving " + location.hostname + " …", "t-dim");
-    await runDnsTest();
-    const d = state.results.dns;
-    if (!d?.ok) return tprint("DNS resolution failed or unavailable.", "t-warn");
-    tprint(`A          ${d.a?.join(", ") ?? NA}`, "t-ok");
-    tprint(`AAAA       ${d.aaaa?.join(", ") ?? NA}`);
-    tprint(`NS         ${d.ns?.join(", ") ?? NA}`);
-    tprint(`resolved in ${d.resolveMs ?? "?"} ms`);
+    await runDnsTests();
+    const r = Engine.results.get("dns-resolve");
+    if (!r || r.status !== "passed") return tprint("DNS lookup failed or requires the backend endpoint.", "t-warn");
+    const d = r.value;
+    tprint(`A          ${d.a?.join(", ") || NA}`, d.a?.length ? "t-ok" : "");
+    tprint(`AAAA       ${d.aaaa?.join(", ") || NA}`);
+    tprint(`NS         ${d.ns?.join(", ") || NA}`);
+    tprint(`resolved   ${d.resolveMs} ms`);
   },
-  performance: () => {
-    const p = performance.getEntriesByType("navigation")[0];
-    if (!p) return;
-    tprint(`dom ready   ${((p.domContentLoadedEventEnd - p.startTime) / 1000).toFixed(2)}s`);
-    tprint(`load        ${((p.loadEventEnd - p.startTime) / 1000).toFixed(2)}s`);
-    tprint(`first paint ${performance.getEntriesByType("paint").find(e => e.name === "first-paint") ? (performance.getEntriesByType("paint").find(e => e.name === "first-paint").startTime / 1000).toFixed(2) + "s" : NA}`);
-    tprint(`resources   ${performance.getEntriesByType("resource").length}`);
-    tprint(`transfer    ${fmtBytes(p.transferSize)}`);
+  performance() {
+    const r = Engine.results.get("perf-nav");
+    if (!r || r.status !== "passed") return ttype("Performance metrics not available yet.", "t-warn");
+    const p = r.value;
+    tprint(`ttfb        ${Math.round(p.ttfb)} ms`);
+    tprint(`fcp         ${p.fcp != null ? (p.fcp / 1000).toFixed(2) + "s" : "n/a"}`);
+    tprint(`lcp         ${state.lcp != null ? (state.lcp / 1000).toFixed(2) + "s" : "n/a"}`);
+    tprint(`dom ready   ${(p.dcl / 1000).toFixed(2)}s`);
+    tprint(`resources   ${(performance.getEntriesByType("resource") || []).length}`);
   },
-  benchmark: () => { ttype("running benchmark…", "t-dim"); runBenchmark(); },
-  clear: () => { termOut.innerHTML = ""; }
+  async diagnostic() {
+    tprint("starting full diagnostic…", "t-dim");
+    await runDiagnostic(FULL_ORDER);
+    tprint(`diagnostic finished — see SYSTEM HEALTH panel.`, "t-ok");
+  }
 };
 
-$("#termForm").addEventListener("submit", e => {
-  e.preventDefault();
-  const input = $("#termInput");
-  const cmd = input.value.trim();
-  input.value = "";
-  if (!cmd) return;
+async function execCommand(raw) {
+  const cmd = raw.trim();
   tprint(`<span class="t-dim">juan@web-lab:~$</span> <span class="t-cmd">${esc(cmd)}</span>`);
-  termHistory.push(cmd);
-  histIdx = termHistory.length;
-  const [base, ...args] = cmd.toLowerCase().split(/\s+/);
-  if (commands[base]) {
-    try { commands[base](args); } catch (err) { tprint("error: " + err.message, "t-err"); }
-  } else {
-    tprint(`command not found: ${esc(base)} — type 'help'`, "t-err");
+  if (!cmd) return;
+  termHistory.unshift(cmd);
+  histIdx = -1;
+  const [base, ...args] = cmd.split(/\s+/);
+  const fn = COMMANDS[base.toLowerCase()];
+  if (!fn) {
+    tprint(`Command not found: ${esc(base)}`, "t-err");
+    tprint(`Type <span class="t-cmd">help</span> for available commands.`, "t-dim");
+    return;
+  }
+  try { await fn(args); }
+  catch (e) { tprint("command error: " + esc(e?.message || e), "t-err"); }
+}
+
+$("#termForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const val = termInput.value;
+  termInput.value = "";
+  await execCommand(val);
+  termInput.focus();
+});
+$("#termWindow").addEventListener("click", () => {
+  if (!getSelection().toString()) termInput.focus();
+});
+termInput.addEventListener("keydown", e => {
+  if (e.key === "ArrowUp") {
+    e.preventDefault();
+    if (histIdx < termHistory.length - 1) termInput.value = termHistory[++histIdx];
+    return;
+  }
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    if (histIdx > 0) termInput.value = termHistory[--histIdx];
+    else { histIdx = -1; termInput.value = ""; }
+    return;
+  }
+  if (e.key === "Tab") {
+    e.preventDefault();
+    const v = termInput.value.trim().toLowerCase();
+    const match = Object.keys(COMMANDS).find(c => c.startsWith(v) && v);
+    if (match) termInput.value = match;
+    return;
+  }
+  if (e.key === "c" && e.ctrlKey) {
+    e.preventDefault();
+    tprint(`<span class="t-dim">juan@web-lab:~$</span> <span class="t-cmd">${esc(termInput.value)}</span>^C`);
+    termInput.value = "";
   }
 });
-$("#termInput").addEventListener("keydown", e => {
-  if (e.key === "ArrowUp") { e.preventDefault(); if (histIdx > 0) $("#termInput").value = termHistory[--histIdx]; }
-  if (e.key === "ArrowDown") { e.preventDefault(); histIdx = Math.min(termHistory.length, histIdx + 1); $("#termInput").value = termHistory[histIdx] ?? ""; }
-});
 
-$$("[data-action]").forEach(btn => btn.addEventListener("click", () => {
-  const action = btn.dataset.action;
-  if (action === "latency") runLatencyTest();
-  if (action === "dns") runDnsTest();
-  if (action === "benchmark") runBenchmark();
+/* ================================================================
+   LAB STATUS + OFFLINE + GLOBAL ERRORS
+   ================================================================ */
+state.isOnline = navigator.onLine;
+function setOnlineUI(online) {
+  state.isOnline = online;
+  $("#offlineBanner").classList.toggle("hidden", online);
+  $("#systemStatus").textContent = online ? $("#systemStatus").textContent.replace("SYSTEM OFFLINE", "SYSTEM ONLINE") : "SYSTEM OFFLINE";
+  if (!online) $("#systemStatus").textContent = "NETWORK OFFLINE";
+  else if (!Engine.running) $("#systemStatus").textContent = "SYSTEM ONLINE";
+}
+window.addEventListener("online", () => { setOnlineUI(true); toast("Back online.", "ok"); });
+window.addEventListener("offline", () => { setOnlineUI(false); toast("Network offline — server tests disabled.", "err"); });
+setOnlineUI(navigator.onLine);
+
+window.addEventListener("error", e => { console.warn("[global]", e.message); });
+window.addEventListener("unhandledrejection", e => { console.warn("[unhandled]", e.reason); });
+
+/* ================================================================
+   NAV
+   ================================================================ */
+$("#navToggle").addEventListener("click", () => {
+  const open = $("#mainNav").classList.toggle("open");
+  $("#navToggle").setAttribute("aria-expanded", String(open));
+});
+$$("#mainNav a").forEach(a => a.addEventListener("click", () => {
+  $("#mainNav").classList.remove("open");
+  $("#navToggle").setAttribute("aria-expanded", "false");
 }));
 
-/* ---------------- init ---------------- */
+/* ================================================================
+   INIT — boot sequence with error isolation
+   ================================================================ */
 (async function init() {
-  tprint(`<span class="t-ok">JUAN WEB LAB shell</span> <span class="t-dim">— connected ${new Date().toLocaleTimeString()}</span>`);
+  tprint(`<span class="t-ok">JUAN WEB LAB shell v2.0</span> <span class="t-dim">— connected ${new Date().toLocaleTimeString()}</span>`);
   tprint(`type <span class="t-cmd">help</span> to list commands.`, "t-dim");
 
-  runClientDetection();
-  runJsEnginePanel();
+  updateViewportPanel();
   tickClock();
 
-  runCapabilityTests();
-  runStorageTests();
-  await runLatencyTest();
-  await runHttpDiagnostics();
-  runPerformancePanel();
-  loadDatabasePanel();
-  loadServerInfo();
+  /* backend probe */
+  try {
+    const st = await api("/api/status", { timeout: 4000 });
+    state.backendOk = true;
+    const el = $("#lsBackend");
+    el.textContent = `● ONLINE (v${st.version || "?"})`;
+    el.className = "v status st-green";
+  } catch {
+    state.backendOk = false;
+    const el = $("#lsBackend");
+    el.textContent = "● UNAVAILABLE";
+    el.className = "v status st-red";
+  }
+
+  /* boot-time modules, each isolated so one failure never blocks the rest */
+  const bootOrder = ["client", "network", "http", "tls", "performance", "jsengine", "clock", "storage", "browser"];
+  for (const key of bootOrder) {
+    if (document.hidden) break;
+    try { await runModule(key); } catch (e) { console.warn("[boot:" + key + "]", e); }
+  }
+
+  /* server-dependent extras (non-blocking) */
+  if (navigator.onLine) {
+    runModule("server").catch(() => {});
+    runModule("database").catch(() => {});
+  }
 })();
